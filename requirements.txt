@@ -1,0 +1,18 @@
+#Requirements for the project
+torch>=2.3
+transformers>=4.43
+accelerate>=0.33
+datasets>=2.20
+peft>=0.12
+bitsandbytes>=0.43
+auto-gptq>=0.7
+evaluate>=0.4
+mlflow>=2.14
+sentencepiece
+tiktoken
+einops
+scikit-learn
+# Required for CodeBLEU metric:
+git+https://github.com/microsoft/CodeXGLUE.git#subdirectory=CodeBLEU
+pyyaml
+pandas

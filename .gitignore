@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.env
+
+# Large/local artifacts 
+data/
+outputs/
+models/
+checkpoints/
+logs/
+mlruns/
+hf_cache/
+reports/*.jsonl
+
+# Large model files
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
