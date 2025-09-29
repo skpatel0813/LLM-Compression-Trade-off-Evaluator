@@ -1,27 +1,24 @@
 # src/data_prep.py
 """
-Resilient data prep for shared clusters (DGX/KSU) where Hugging Face `datasets`
-may crash with:
-  NotImplementedError: Loading a dataset cached in a LocalFileSystem is not supported.
+Reliable data preparation for shared computers where downloading datasets might crash.
 
-Strategy:
-  • Prefer NON-STREAMING small slices but force everything into memory
-    (keep_in_memory=True) and isolate cache to a fresh local dir.
-  • If that still fails due to FS quirks, fall back to STREAMING with caps and
-    proactively delete only the relevant cached dataset dirs to unblock streaming.
+This script safely downloads coding examples and turns them into chat conversations.
+It has two ways to work:
+  • Method 1: Download small pieces and keep them in memory (like reading a short book)
+  • Method 2: Stream data like watching a video if Method 1 doesn't work
 
-Outputs (JSONL in data/):
+What we create:
   data/opencodeinstruct_python_train.jsonl
   data/codesearchnet_python_train.jsonl
 
-Env knobs:
-  # Non-streaming (preferred if pyarrow present)
+Settings you can change:
+  # For Method 1 (small pieces)
   OCI_PCT=1   CSN_PCT=1
 
-  # Streaming fallback (if non-streaming fails)
+  # For Method 2 (streaming with limits)
   OCI_MAX=200000  CSN_MAX=100000
 
-Optional reliability (keep global cache clean):
+To keep things tidy:
   export HF_HOME="$PWD/hf_cache"
   export HF_DATASETS_CACHE="$PWD/hf_cache/datasets"
 """
@@ -32,14 +29,16 @@ import json
 import itertools
 from typing import Optional
 
+# Where we'll save our conversation files
 OUTDIR = "data"
 os.makedirs(OUTDIR, exist_ok=True)
 
-# Use a fresh, isolated cache inside the project to avoid collisions.
+# Create a special folder just for our downloads to avoid mixing with others
 ISOLATED_CACHE = os.path.join(os.getcwd(), "hf_cache_isolated")
 os.makedirs(ISOLATED_CACHE, exist_ok=True)
 
 def has_pyarrow() -> bool:
+    """Check if we have the special tool that helps read data faster"""
     try:
         import pyarrow  # noqa: F401
         return True
@@ -47,23 +46,25 @@ def has_pyarrow() -> bool:
         return False
 
 def env_int(name: str, default: int) -> int:
+    """Read numbers from settings, use default if not provided"""
     try:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return default
 
-# Non-streaming slice sizes (percentages of each split)
-OCI_PCT = env_int("OCI_PCT", 1)    # e.g., 1 => train[:1%]
-CSN_PCT = env_int("CSN_PCT", 1)    # applied to both train and validation
+# How much data to take for Method 1 (like taking 1% of a big cake)
+OCI_PCT = env_int("OCI_PCT", 1)    # Take 1% of OpenCodeInstruct
+CSN_PCT = env_int("CSN_PCT", 1)    # Take 1% of CodeSearchNet
 
-# Streaming caps (row counts)
-OCI_MAX = env_int("OCI_MAX", 200_000)
-CSN_MAX = env_int("CSN_MAX", 100_000)
+# How many examples to take for Method 2 (like counting how many candies to take)
+OCI_MAX = env_int("OCI_MAX", 200_000)  # Maximum 200,000 from OpenCodeInstruct
+CSN_MAX = env_int("CSN_MAX", 100_000)  # Maximum 100,000 from CodeSearchNet
 
 def to_chat(instruction: str, _input: str, output: str) -> dict:
+    """Turn coding examples into friendly chat conversations"""
     system = (
-        "You are a precise Python coding assistant. "
-        "Prefer minimal, runnable code and include brief tests when sensible."
+        "You are a helpful Python coding assistant. "
+        "Write clean, working code and include simple tests when helpful."
     )
     user = (instruction or "")
     if _input:
@@ -77,23 +78,24 @@ def to_chat(instruction: str, _input: str, output: str) -> dict:
     }
 
 def is_python_lang(ex) -> bool:
+    """Check if this example is written in Python (like checking if a book is in English)"""
     lang = (ex.get("language") or "").lower()
     return ("python" in lang) or (lang == "py") or (lang.endswith("/python"))
 
 def delete_dataset_cache_like(substr_list) -> None:
     """
-    Remove ONLY the specific dataset cache directories whose names contain any
-    of the given substrings (e.g. 'nvidia___open_code_instruct', 'code_search_net').
-    We search common cache roots, including project-local caches.
+    Clean up old downloaded data that might cause problems.
+    Like cleaning your room before starting a new project.
     """
+    # Look in different places where data might be stored
     roots = []
-    # Respect user-provided HF_DATASETS_CACHE first
+    # First check if user told us where to look
     if os.environ.get("HF_DATASETS_CACHE"):
         roots.append(os.environ["HF_DATASETS_CACHE"])
-    # Project-local caches
+    # Check our project folders
     roots.append(os.path.join(os.getcwd(), "hf_cache", "datasets"))
     roots.append(os.path.join(os.getcwd(), "hf_cache_isolated", "datasets"))
-    # User default cache
+    # Check the usual hiding spot
     roots.append(os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "datasets"))
 
     seen = set()
@@ -105,38 +107,41 @@ def delete_dataset_cache_like(substr_list) -> None:
             if not os.path.isdir(path): 
                 continue
             low = name.lower()
+            # If this folder matches what we're looking for, clean it up
             if any(s in low for s in substr_list):
                 if path in seen: 
                     continue
-                print(f"[info] Removing cached dataset dir to unblock: {path}")
+                print(f"[info] Cleaning up old data: {path}")
                 seen.add(path)
                 try:
                     import shutil
                     shutil.rmtree(path)
                 except Exception as e:
-                    print(f"[warn] Failed to remove {path}: {e}")
+                    print(f"[warn] Couldn't clean {path}: {e}")
 
-# ---------------------- NON-STREAMING (preferred) -------------------------------------
+# ---------------------- METHOD 1: NON-STREAMING (like reading a book) -------------------------------------
 
 def prepare_non_streaming() -> None:
     """
-    Load small slices into memory (keep_in_memory=True) and isolate cache directory
-    to avoid writing Arrow tables to problematic shared filesystems.
+    Download small pieces of data and keep them in memory.
+    Like borrowing a few books from the library instead of the whole shelf.
     """
     from datasets import load_dataset
 
-    # 1) OpenCodeInstruct (Python-only)
+    # 1) Get Python coding examples from OpenCodeInstruct
     oci_split = f"train[:{OCI_PCT}%]"
-    print(f"[non-streaming] Loading nvidia/OpenCodeInstruct split={oci_split} (in-memory)")
+    print(f"[Method 1] Getting {OCI_PCT}% of OpenCodeInstruct examples (keeping in memory)")
     oci = load_dataset(
         "nvidia/OpenCodeInstruct",
         split=oci_split,
         cache_dir=ISOLATED_CACHE,
-        keep_in_memory=True,               # <- critical: avoid FS writes
+        keep_in_memory=True,               # <- Important: keep everything in memory
         download_mode="reuse_cache_if_exists",
     )
+    # Only keep Python examples
     oci_py = oci.filter(is_python_lang)
 
+    # Save as conversation file
     oci_out = os.path.join(OUTDIR, "opencodeinstruct_python_train.jsonl")
     rows_oci = 0
     with open(oci_out, "w", encoding="utf-8") as f:
@@ -144,12 +149,12 @@ def prepare_non_streaming() -> None:
             rec = to_chat(ex.get("instruction"), ex.get("input"), ex.get("output"))
             f.write(json.dumps(rec) + "\n")
             rows_oci += 1
-    print(f"✅ Wrote {oci_out} ({rows_oci} rows)")
+    print(f"Saved {oci_out} ({rows_oci} conversations)")
 
-    # 2) CodeSearchNet:python (train + val), also in-memory
+    # 2) Get more examples from CodeSearchNet
     csn_train_split = f"train[:{CSN_PCT}%]"
     csn_val_split   = f"validation[:{CSN_PCT}%]"
-    print(f"[non-streaming] Loading code_search_net:python train={csn_train_split} val={csn_val_split} (in-memory)")
+    print(f"[Method 1] Getting {CSN_PCT}% of CodeSearchNet examples (keeping in memory)")
     csn_tr = load_dataset(
         "code_search_net", "python", split=csn_train_split,
         cache_dir=ISOLATED_CACHE, keep_in_memory=True, download_mode="reuse_cache_if_exists",
@@ -160,8 +165,9 @@ def prepare_non_streaming() -> None:
     )
 
     def to_pair(ex):
-        doc  = (ex.get("func_documentation_string") or "").strip()
-        code = (ex.get("func_code_string") or "").strip()
+        """Turn code examples into question-answer pairs"""
+        doc  = (ex.get("func_documentation_string") or "").strip()  # The description
+        code = (ex.get("func_code_string") or "").strip()           # The code answer
         if doc and code:
             return to_chat("Write the Python function described by this docstring:", doc, code)
         return None
@@ -169,44 +175,46 @@ def prepare_non_streaming() -> None:
     csn_out = os.path.join(OUTDIR, "codesearchnet_python_train.jsonl")
     rows_csn = 0
     with open(csn_out, "w", encoding="utf-8") as f:
+        # Save training examples
         for ex in csn_tr:
             rec = to_pair(ex)
             if rec:
                 f.write(json.dumps(rec) + "\n")
                 rows_csn += 1
+        # Save validation examples
         for ex in csn_va:
             rec = to_pair(ex)
             if rec:
                 f.write(json.dumps(rec) + "\n")
                 rows_csn += 1
-    print(f"✅ Wrote {csn_out} ({rows_csn} rows)")
-    print("✅ Data prep complete (non-streaming, in-memory). Increase OCI_PCT/CSN_PCT if resources allow.")
+    print(f"Saved {csn_out} ({rows_csn} conversations)")
+    print("All done with Method 1! You can get more data by increasing OCI_PCT/CSN_PCT.")
 
-# ---------------------- STREAMING (fallback) ------------------------------------------
+# ---------------------- METHOD 2: STREAMING (like watching a video) ------------------------------------------
 
 def prepare_streaming() -> None:
     """
-    Streaming with row caps. Before streaming, delete only the relevant cached
-    dataset dirs so `datasets` won’t hit local shards and crash.
+    Stream data with limits. Clean up first to avoid problems.
+    Like watching a movie online instead of downloading it.
     """
     from datasets import load_dataset
 
-    # Remove stale caches that break streaming
+    # Clean up first to avoid problems
     delete_dataset_cache_like([
         "nvidia___open_code_instruct",
-        "open_code_instruct",              # catch variants
+        "open_code_instruct",              # different name styles
         "code_search_net",
         "codesearchnet",
     ])
 
-    # 1) OpenCodeInstruct (stream)
-    print("[streaming] Streaming nvidia/OpenCodeInstruct (Python-only)…")
+    # 1) Stream OpenCodeInstruct examples
+    print("[Method 2] Streaming OpenCodeInstruct Python examples…")
     rows_oci = 0
     oci_out = os.path.join(OUTDIR, "opencodeinstruct_python_train.jsonl")
     try:
         oci_stream = load_dataset("nvidia/OpenCodeInstruct", split="train", streaming=True)
     except NotImplementedError:
-        print("[warn] Streaming refused for OpenCodeInstruct; skipping OCI.")
+        print("[warn] Streaming not working for OpenCodeInstruct; skipping this one.")
         oci_stream = None
 
     if oci_stream is not None:
@@ -217,14 +225,15 @@ def prepare_streaming() -> None:
                 rec = to_chat(ex.get("instruction"), ex.get("input"), ex.get("output"))
                 f.write(json.dumps(rec) + "\n")
                 rows_oci += 1
+                # Stop when we have enough
                 if rows_oci >= OCI_MAX:
                     break
-        print(f"✅ Wrote {oci_out} ({rows_oci} rows)")
+        print(f"Saved {oci_out} ({rows_oci} conversations)")
     else:
-        print("[info] Skipped OCI; no file written.")
+        print("[info] No OpenCodeInstruct data saved.")
 
-    # 2) CodeSearchNet:python (stream)
-    print("[streaming] Streaming code_search_net:python (train + validation)…")
+    # 2) Stream CodeSearchNet examples
+    print("[Method 2] Streaming CodeSearchNet Python examples…")
     rows_csn = 0
     csn_out = os.path.join(OUTDIR, "codesearchnet_python_train.jsonl")
 
@@ -232,12 +241,11 @@ def prepare_streaming() -> None:
         csn_tr = load_dataset("code_search_net", "python", split="train", streaming=True)
         csn_va = load_dataset("code_search_net", "python", split="validation", streaming=True)
     except NotImplementedError:
-        print("[warn] Streaming refused for CodeSearchNet even after cleanup. Try non-streaming small slices by installing pyarrow:\n"
-              "    conda install -y -n llama311 -c conda-forge pyarrow\n"
-              "Proceeding with zero CSN rows.")
+        print("[warn] Streaming not working for CodeSearchNet. Try Method 1 by installing pyarrow.")
         csn_tr = csn_va = None
 
     def csn_pairs(stream):
+        """Get question-answer pairs from the stream"""
         for ex in stream:
             doc = (ex.get("func_documentation_string") or "").strip()
             code = (ex.get("func_code_string") or "").strip()
@@ -246,28 +254,30 @@ def prepare_streaming() -> None:
 
     with open(csn_out, "w", encoding="utf-8") as f:
         if csn_tr is not None:
+            # Take half from training data
             for rec in itertools.islice(csn_pairs(csn_tr), CSN_MAX // 2):
                 f.write(json.dumps(rec) + "\n"); rows_csn += 1
         if csn_va is not None:
+            # Take the rest from validation data
             for rec in itertools.islice(csn_pairs(csn_va), CSN_MAX - rows_csn):
                 f.write(json.dumps(rec) + "\n"); rows_csn += 1
-    print(f"✅ Wrote {csn_out} ({rows_csn} rows)")
-    print("✅ Data prep complete (streaming fallback).")
+    print(f"Saved {csn_out} ({rows_csn} conversations)")
+    print(" All done with Method 2!")
 
-# ---------------------- Entrypoint ----------------------------------------------------
+# ---------------------- Starting Point ----------------------------------------------------
 
 def main():
-    # Prefer non-streaming with in-memory slices if pyarrow is present.
+    # Try Method 1 first if we have the right tools
     if has_pyarrow():
-        print("[mode] pyarrow detected → non-streaming (in-memory) small slices.")
+        print("[choice] Using Method 1: Small pieces in memory")
         try:
             prepare_non_streaming()
             return
         except NotImplementedError as e:
-            print(f"[warn] Non-streaming still failed on this FS: {e}\n"
-                  f"       Falling back to streaming with caps…")
+            print(f"[warning] Method 1 didn't work: {e}\n"
+                  f"          Trying Method 2 instead…")
 
-    print("[mode] Using streaming fallback with caps.")
+    print("[choice] Using Method 2: Streaming with limits")
     prepare_streaming()
 
 if __name__ == "__main__":
