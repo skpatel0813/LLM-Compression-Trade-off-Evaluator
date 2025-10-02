@@ -1,30 +1,33 @@
 # src/train_kd.py
 # --------------------------------------------------------------------------------------
-# Smart Learning: Teaching a small AI model from a big AI model
-#   Big Teacher:  Llama-3.1-70B-Instruct (like a wise professor)
-#   Small Student: Llama-3.1-8B-Instruct (like a smart student)
+# Knowledge Distillation with LoRA (Llama 3.1 70B -> 8B) for Python code generation
 #
-# What this script does
-# ---------------------
-# 1) Reads conversation files we created earlier:
-#       - data/opencodeinstruct_python_train.jsonl
-#       - data/codesearchnet_python_train.jsonl
-#    Each line is a conversation between people and AI assistant.
+# - Teacher:  meta-llama/Meta-Llama-3.1-70B-Instruct
+# - Student:  meta-llama/Meta-Llama-3.1-8B-Instruct (trained with LoRA adapters)
 #
-# 2) Formats chats for Llama 3, tokenizes, and batches.
+# What this script does:
+#   1) Loads chat-style training data from JSONL files in ./data
+#        - opencodeinstruct_python_train.jsonl (optional)
+#        - codesearchnet_python_train.jsonl    (required for a quick smoke run)
+#      Each line must be: {"messages": [{"role": "...", "content": "..."}, ...]}
 #
-# 3) Uses LoRA to train a small subset of weights (efficient).
+#   2) Builds Llama-3 chat prompts, tokenizes, and creates labels for next-token prediction.
 #
-# 4) Loss = alpha * KL(student || teacher) at temperature T + (1-alpha) * CE(gold)
+#   3) Runs KD:
+#        loss = alpha * KL( student || teacher_T ) * T^2  +  (1 - alpha) * CE(gold)
 #
-# 5) Saves the learned LoRA adapters to outputs/lora.
+#   4) Trains only LoRA adapter parameters (tiny % of weights), then saves them to:
+#        ./outputs/lora/  (path comes from configs/project.yaml via utils.Config)
 #
-# Notes
-# -----
-# - Uses device_map="auto" to shard across GPUs/CPU. Trainer is patched to NOT
-#   move the model again (avoids meta-tensor crash).
-# - Set MAX_SAMPLES=N to do a smoke run.
-# - Use --bf16/--fp16 flags to control numerics; default auto-detects BF16.
+# Key implementation notes:
+#   - We load both teacher and student with device_map="auto" to shard across GPU/CPU.
+#   - We override Trainer._move_model_to_device(...) to NO-OP so Trainer does not call
+#     .to(device) again on a sharded/meta-initialized model (prevents meta-tensor crash).
+#   - We pass dtype=... instead of torch_dtype=... (newer API, silences deprecation).
+#   - Collator returns a plain dict (NOT a dataclass) so Trainer can iterate/inspect it.
+#
+# Usage (single GPU smoke run):
+#   CUDA_VISIBLE_DEVICES=0 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kd --bf16 True
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -33,7 +36,6 @@ import json
 import random
 import warnings
 import argparse
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 
 import torch
@@ -51,13 +53,13 @@ from transformers import (
 
 from peft import LoraConfig, get_peft_model, TaskType
 
-# ---- Our helper tools ----
+# Project helpers (expects ./configs/project.yaml and ./src/utils.py)
 from .utils import Config, build_chat_text
 
 
-# ===========================
-# Make things predictable
-# ===========================
+# ------------------------------
+# Reproducibility & tiny speedups
+# ------------------------------
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -65,24 +67,29 @@ def set_seed(seed: int = 42) -> None:
 
 set_seed(42)
 
-# Optional: slightly faster matmul on Ampere+
 try:
+    # marginally faster matmul on Ampere+ without changing numerics
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-# Use special folders for downloads if user wants
+# Respect custom cache dirs if set
 for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
     v = os.environ.get(env_var)
     if v:
         os.makedirs(v, exist_ok=True)
 
 
-# ===========================
-# Reading our conversation files
-# ===========================
+# ------------------------------
+# Lightweight JSONL reader
+# ------------------------------
 class ChatJsonlReader(Dataset):
-    """Memory-light JSONL reader with byte offsets (no full read into RAM)."""
+    """
+    Memory-light dataset:
+      - Builds an index of byte offsets (file, offset) across N JSONL files
+      - __getitem__ seeks and reads one line only (O(1) memory)
+      - Optional MAX_SAMPLES limit via env var or constructor
+    """
 
     def __init__(self, files: List[str], max_samples: Optional[int] = None):
         self.index: List[Tuple[str, int]] = []  # (file_path, byte_offset)
@@ -112,28 +119,24 @@ class ChatJsonlReader(Dataset):
         with open(fp, "rb") as f:
             f.seek(offset)
             raw = f.readline()
-        ex = json.loads(raw.decode("utf-8"))
-        return ex
+        return json.loads(raw.decode("utf-8"))
 
 
-@dataclass
-class TokenizedBatch:
-    input_ids: torch.LongTensor
-    attention_mask: torch.LongTensor
-    labels: torch.LongTensor
-
-
+# ------------------------------
+# Collator: chats -> tokenized tensors -> labels
+# ------------------------------
 class CausalCollator:
     """
-    Converts chats to Llama3 prompt format, tokenizes, pads, and builds labels.
-    By default we supervise all non-padding tokens (simple KD+CE).
+    Converts chat messages to Llama-3 chat format, tokenizes, pads, and builds labels.
+    Returns a PLAIN DICT so `transformers.Trainer` can consume it directly.
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase, max_seq_len: int):
         self.tok = tokenizer
         self.max_len = max_seq_len
 
-    def __call__(self, features: List[Dict[str, Any]]) -> TokenizedBatch:
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Convert JSONL "messages" -> Llama 3 chat-formatted string
         texts = [build_chat_text(ex["messages"]) for ex in features]
 
         enc = self.tok(
@@ -147,27 +150,27 @@ class CausalCollator:
         input_ids = enc["input_ids"]
         attention_mask = enc["attention_mask"]
 
-        # Supervise all non-pad tokens (ignore padding)
+        # Supervise all non-pad tokens (ignore padding with -100)
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
 
-        return TokenizedBatch(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-        )
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
 
-# ===========================
-# KD helpers
-# ===========================
+# ------------------------------
+# KD helpers (next-token alignment)
+# ------------------------------
 def shift_for_next_token(
     logits: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Align teacher/student outputs for next-token prediction:
-    - compare s_logits[:, t] vs gold at t+1
-    - mask with attention and ignore_index
+    Align for next-token prediction:
+      - Compare logits at time t to gold token at t+1
+      - Mask with attention and ignore_index
     """
     s_logits = logits[:, :-1, :]
     labels_shifted = labels[:, 1:]
@@ -185,7 +188,7 @@ def kd_loss(
     alpha: float = 0.5,
 ) -> torch.Tensor:
     """
-    KL(student || teacher_T) * T^2 * alpha + CE(student, gold) * (1-alpha)
+    loss = alpha * KL( student || teacher_T ) * T^2  +  (1 - alpha) * CE(student, gold)
     """
     s_next, gold, valid_mask = shift_for_next_token(s_logits, labels, attention_mask)
     t_next, _, _ = shift_for_next_token(t_logits, labels, attention_mask)
@@ -208,11 +211,16 @@ def kd_loss(
     return alpha * kl + (1.0 - alpha) * ce
 
 
-# ===========================
-# KD Trainer
-# ===========================
+# ------------------------------
+# Custom Trainer with NO-OP device move
+# ------------------------------
 class KDTrainer(Trainer):
-    """Runs student forward; gets teacher logits under no-grad; combines losses."""
+    """
+    Trainer that:
+      - Keeps model placement as loaded by device_map="auto" (NO .to(device) calls)
+      - Runs teacher in no_grad
+      - Computes KD loss
+    """
 
     def __init__(self, *args, teacher: nn.Module, T: float, alpha: float, **kwargs):
         super().__init__(*args, **kwargs)
@@ -222,11 +230,9 @@ class KDTrainer(Trainer):
         self.T = float(T)
         self.alpha = float(alpha)
 
-    # CRITICAL: prevent Trainer from calling `.to(device)` on a device-mapped/meta model
-    # This avoids: "Cannot copy out of meta tensor; no data!"
+    # CRITICAL: prevent Trainer from moving a sharded/meta-initialized model
+    # (avoids: "Cannot copy out of meta tensor; no data!")
     def _move_model_to_device(self, model, device):
-        # Model is already dispatched by device_map="auto" (and/or meta init)
-        # Return as-is to keep sharded weights on their assigned devices.
         return model
 
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -250,15 +256,15 @@ class KDTrainer(Trainer):
         return (loss, s_out) if return_outputs else loss
 
 
-# ===========================
-# Main Training Program
-# ===========================
+# ------------------------------
+# CLI + main
+# ------------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bf16", type=str, default=None,
-                    help="True/False to force bfloat16; default: auto (A100 => True).")
+                    help="True/False to force bfloat16; default: auto if supported.")
     ap.add_argument("--fp16", type=str, default=None,
-                    help="True/False to force float16; default: opposite of bf16 if cuda.")
+                    help="True/False to force float16; default: opposite of bf16 when CUDA.")
     ap.add_argument("--logging_steps", type=int, default=int(os.environ.get("LOGGING_STEPS", "20")))
     return ap.parse_args()
 
@@ -278,7 +284,7 @@ def main():
     os.makedirs(P["outputs_dir"], exist_ok=True)
     os.makedirs(P["lora_dir"], exist_ok=True)
 
-    MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "0"))  # 0 = use all
+    MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "0"))  # 0 = use all rows
 
     # -------------------------
     # Tokenizer
@@ -288,7 +294,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # -------------------------
-    # Numerics (bf16 / fp16)
+    # Numerics (bf16/fp16 selection)
     # -------------------------
     if torch.cuda.is_available():
         auto_bf16 = torch.cuda.is_bf16_supported()
@@ -316,15 +322,15 @@ def main():
     dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
 
     # -------------------------
-    # Load TEACHER & STUDENT with device maps (no .to(device) later!)
+    # Load Teacher & Student (sharded)
     # -------------------------
     print("Loading the WISE TEACHER:", M["teacher_id"])
     teacher = AutoModelForCausalLM.from_pretrained(
         M["teacher_id"],
-        dtype=dtype,                      # (new arg name; replaces torch_dtype)
-        device_map="auto",                # let Accelerate spread across GPUs/CPU
+        dtype=dtype,                  # replaces deprecated torch_dtype
+        device_map="auto",
         low_cpu_mem_usage=True,
-        offload_state_dict=True,          # avoid loading full weights in RAM first
+        offload_state_dict=True,
     )
     print("Loading the SMART STUDENT:", M["student_id"])
     student = AutoModelForCausalLM.from_pretrained(
@@ -335,12 +341,12 @@ def main():
         offload_state_dict=True,
     )
 
-    # Enable grad checkpointing before PEFT to reduce memory
+    # Enable grad checkpointing before PEFT to reduce activation memory
     if hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
 
     # -------------------------
-    # LoRA
+    # LoRA config
     # -------------------------
     lcfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -355,7 +361,7 @@ def main():
     )
     student = get_peft_model(student, lcfg)
 
-    # Parameter count (for info)
+    # Info: trainable vs total params
     trainable, total = 0, 0
     for p in student.parameters():
         n = p.numel()
@@ -363,27 +369,32 @@ def main():
         if p.requires_grad:
             trainable += n
     print(f"Teaching only: {trainable:,} parts out of {total:,} total "
-          f"({100*trainable/total:.2f}%) - that's efficient!")
+          f"({100 * trainable / total:.2f}%) - that's efficient!")
 
     # -------------------------
-    # Dataset + collator
+    # Dataset & collator
     # -------------------------
     data_files = [
         os.path.join(P["data_dir"], "opencodeinstruct_python_train.jsonl"),
         os.path.join(P["data_dir"], "codesearchnet_python_train.jsonl"),
     ]
+    # Keep only files that exist and are non-empty
+    data_files = [fp for fp in data_files if os.path.isfile(fp) and os.path.getsize(fp) > 0]
+
     ds = ChatJsonlReader(
-        [fp for fp in data_files if os.path.isfile(fp)],
+        data_files,
         max_samples=(MAX_SAMPLES if MAX_SAMPLES > 0 else None),
     )
     if len(ds) == 0:
-        raise FileNotFoundError("No learning materials found! Please run data_prep.py first.")
+        raise FileNotFoundError(
+            "No learning materials found! Run data_prep.py to build JSONL data first."
+        )
     collator = CausalCollator(tokenizer, max_seq_len=Tcfg["seq_len"])
 
     # -------------------------
     # TrainingArguments
-    # - We DO NOT pass place_model_on_device (not available on some versions)
-    # - Our KDTrainer overrides _move_model_to_device to NO-OP.
+    #   NOTE: We DO NOT pass `place_model_on_device` (not available everywhere).
+    #         Our KDTrainer overrides `_move_model_to_device` to NO-OP instead.
     # -------------------------
     targs = TrainingArguments(
         output_dir=os.path.join(P["outputs_dir"], "llama31_8b_kd_lora"),
@@ -392,7 +403,7 @@ def main():
         gradient_accumulation_steps=Tcfg["grad_accum"],
         learning_rate=Tcfg["learning_rate"],
         warmup_ratio=0.03,
-        logging_steps=args_cli.logging_steps,
+        logging_steps=int(args_cli.logging_steps),
         save_steps=500,
         save_total_limit=2,
         bf16=use_bf16,
@@ -401,10 +412,10 @@ def main():
         optim="adamw_torch",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
-        report_to=[],                      # no external logging
+        report_to=[],                # no external logging
         dataloader_num_workers=2,
         ddp_find_unused_parameters=False,
-        remove_unused_columns=False,       # safer for custom collators/LMs
+        remove_unused_columns=False, # safer for custom collators/LMs
     )
 
     # -------------------------
@@ -415,16 +426,20 @@ def main():
         args=targs,
         train_dataset=ds,
         data_collator=collator,
-        tokenizer=tokenizer,               # deprecation warning is harmless for now
+        tokenizer=tokenizer,  # transformer 5.0 will prefer processing_class; fine for now
         teacher=teacher,
         T=float(Tcfg.get("kd_temp", 1.0)),
         alpha=float(Tcfg.get("kd_alpha", 0.5)),
     )
 
+    # -------------------------
     # Train
+    # -------------------------
     trainer.train()
 
-    # Save LoRA adapters (and tokenizer for convenience)
+    # -------------------------
+    # Save LoRA adapters (and tokenizer)
+    # -------------------------
     print("Saving the student's knowledge to:", P["lora_dir"])
     student.save_pretrained(P["lora_dir"])
     tokenizer.save_pretrained(P["lora_dir"])
