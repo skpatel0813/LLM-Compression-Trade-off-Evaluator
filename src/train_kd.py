@@ -3,30 +3,21 @@
 # Knowledge Distillation with LoRA (Llama 3.1 70B -> 8B) for Python code generation
 #
 # - Teacher:  meta-llama/Meta-Llama-3.1-70B-Instruct
-# - Student:  meta-llama/Meta-Llama-3.1-8B-Instruct (trained with LoRA adapters)
+# - Student:  meta-llama/Meta-Llama-3.1-8B-Instruct  (fine-tuned with LoRA adapters)
 #
-# What this script does:
-#   1) Loads chat-style training data from JSONL files in ./data
-#        - opencodeinstruct_python_train.jsonl (optional)
-#        - codesearchnet_python_train.jsonl    (required for a quick smoke run)
-#      Each line must be: {"messages": [{"role": "...", "content": "..."}, ...]}
+# Pipeline:
+#   (1) Read chat-style JSONL from ./data (each line: {"messages": [...]})
+#   (2) Format to Llama-3 chat, tokenize, build labels
+#   (3) KD loss = alpha * KL( student || teacher_T ) * T^2  +  (1 - alpha) * CE(gold)
+#   (4) Train only LoRA params (tiny %) and save adapters to outputs/lora
 #
-#   2) Builds Llama-3 chat prompts, tokenizes, and creates labels for next-token prediction.
+# Engineering choices that avoid your recent errors:
+#   - Load both models with device_map="auto" and dtype=... (not torch_dtype)
+#   - Override Trainer._move_model_to_device to NO-OP (prevents meta-tensor crash)
+#   - Collator returns a PLAIN DICT (not a dataclass) so Trainer can inspect it
+#   - KDTrainer.compute_loss accepts **kwargs / num_items_in_batch (HF>=4.45)
 #
-#   3) Runs KD:
-#        loss = alpha * KL( student || teacher_T ) * T^2  +  (1 - alpha) * CE(gold)
-#
-#   4) Trains only LoRA adapter parameters (tiny % of weights), then saves them to:
-#        ./outputs/lora/  (path comes from configs/project.yaml via utils.Config)
-#
-# Key implementation notes:
-#   - We load both teacher and student with device_map="auto" to shard across GPU/CPU.
-#   - We override Trainer._move_model_to_device(...) to NO-OP so Trainer does not call
-#     .to(device) again on a sharded/meta-initialized model (prevents meta-tensor crash).
-#   - We pass dtype=... instead of torch_dtype=... (newer API, silences deprecation).
-#   - Collator returns a plain dict (NOT a dataclass) so Trainer can iterate/inspect it.
-#
-# Usage (single GPU smoke run):
+# Quick smoke run:
 #   CUDA_VISIBLE_DEVICES=0 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kd --bf16 True
 # --------------------------------------------------------------------------------------
 
@@ -68,8 +59,7 @@ def set_seed(seed: int = 42) -> None:
 set_seed(42)
 
 try:
-    # marginally faster matmul on Ampere+ without changing numerics
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("high")  # small matmul speedup on Ampere+
 except Exception:
     pass
 
@@ -235,7 +225,8 @@ class KDTrainer(Trainer):
     def _move_model_to_device(self, model, device):
         return model
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    # Accept **kwargs/num_items_in_batch to be compatible with new Trainer API
+    def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         labels = inputs["labels"]
@@ -426,7 +417,7 @@ def main():
         args=targs,
         train_dataset=ds,
         data_collator=collator,
-        tokenizer=tokenizer,  # transformer 5.0 will prefer processing_class; fine for now
+        tokenizer=tokenizer,  # deprecation warning is harmless for now
         teacher=teacher,
         T=float(Tcfg.get("kd_temp", 1.0)),
         alpha=float(Tcfg.get("kd_alpha", 0.5)),
