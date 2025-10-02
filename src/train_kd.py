@@ -2,28 +2,30 @@
 # --------------------------------------------------------------------------------------
 # Knowledge Distillation with LoRA (Llama 3.1 70B -> 8B) for Python code generation
 #
-# - Teacher:  meta-llama/Meta-Llama-3.1-70B-Instruct
-# - Student:  meta-llama/Meta-Llama-3.1-8B-Instruct  (fine-tuned with LoRA adapters)
+# Major updates in this version:
+#   • Robust multi-GPU & low-memory loading:
+#       - Optional 4-bit/8-bit quantization for the TEACHER (70B) to avoid OOM
+#       - Auto “device_map=auto” with per-GPU max_memory caps
+#       - Safe no-op device move inside Trainer to avoid meta-tensor crash
+#   • Trainer compatibility with latest HF (accepts **kwargs/num_items_in_batch)
+#   • Collator returns plain dict (needed by Trainer internals)
+#   • CLI flags to control precision, seq_len, memory caps, quantization
 #
-# Pipeline:
-#   (1) Read chat-style JSONL from ./data (each line: {"messages": [...]})
-#   (2) Format to Llama-3 chat, tokenize, build labels
-#   (3) KD loss = alpha * KL( student || teacher_T ) * T^2  +  (1 - alpha) * CE(gold)
-#   (4) Train only LoRA params (tiny %) and save adapters to outputs/lora
-#
-# Engineering choices that avoid your recent errors:
-#   - Load both models with device_map="auto" and dtype=... (not torch_dtype)
-#   - Override Trainer._move_model_to_device to NO-OP (prevents meta-tensor crash)
-#   - Collator returns a PLAIN DICT (not a dataclass) so Trainer can inspect it
-#   - KDTrainer.compute_loss accepts **kwargs / num_items_in_batch (HF>=4.45)
-#
-# Quick smoke run:
+# Example (single GPU, bf16 if available):
 #   CUDA_VISIBLE_DEVICES=0 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kd --bf16 True
+#
+# Example (multi-GPU model sharding across 0,1,2,3; 4-bit teacher to save VRAM):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 MAX_SAMPLES=5000 "$CONDA_PREFIX/bin/python" -u -m src.train_kd \
+#     --bf16 True --teacher_4bit True --max_memory_frac 0.90
+#
+# Requirements:
+#   transformers>=4.44, accelerate>=0.33, peft, (optional) bitsandbytes for 4/8-bit
 # --------------------------------------------------------------------------------------
 
 from __future__ import annotations
 import os
 import json
+import math
 import random
 import warnings
 import argparse
@@ -42,6 +44,13 @@ from transformers import (
     TrainingArguments,
 )
 
+# Optional (only needed if you use 4/8-bit)
+try:
+    from transformers import BitsAndBytesConfig
+    _HAS_BNB = True
+except Exception:
+    _HAS_BNB = False
+
 from peft import LoraConfig, get_peft_model, TaskType
 
 # Project helpers (expects ./configs/project.yaml and ./src/utils.py)
@@ -49,7 +58,7 @@ from .utils import Config, build_chat_text
 
 
 # ------------------------------
-# Reproducibility & tiny speedups
+# Reproducibility & CUDA settings
 # ------------------------------
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
@@ -58,10 +67,14 @@ def set_seed(seed: int = 42) -> None:
 
 set_seed(42)
 
+# Small speedups where possible
 try:
-    torch.set_float32_matmul_precision("high")  # small matmul speedup on Ampere+
+    torch.set_float32_matmul_precision("high")
 except Exception:
     pass
+
+# Helpful to reduce fragmentation on long runs
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Respect custom cache dirs if set
 for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
@@ -126,7 +139,6 @@ class CausalCollator:
         self.max_len = max_seq_len
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # Convert JSONL "messages" -> Llama 3 chat-formatted string
         texts = [build_chat_text(ex["messages"]) for ex in features]
 
         enc = self.tok(
@@ -157,11 +169,6 @@ class CausalCollator:
 def shift_for_next_token(
     logits: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Align for next-token prediction:
-      - Compare logits at time t to gold token at t+1
-      - Mask with attention and ignore_index
-    """
     s_logits = logits[:, :-1, :]
     labels_shifted = labels[:, 1:]
     attn_shifted = attention_mask[:, 1:]
@@ -202,6 +209,36 @@ def kd_loss(
 
 
 # ------------------------------
+# Memory helpers
+# ------------------------------
+def make_max_memory_map(frac: float = 0.9) -> Dict[int, str]:
+    """
+    Build a max_memory map per visible GPU using a fraction of *currently free* memory.
+    This helps Accelerate/HF shard large models safely across multiple GPUs.
+
+    Returns e.g. {0: '70GiB', 1: '70GiB'} strings as expected by HF loaders.
+    """
+    max_mem = {}
+    if not torch.cuda.is_available():
+        return max_mem
+    n = torch.cuda.device_count()
+    for i in range(n):
+        free, total = torch.cuda.mem_get_info(i)  # bytes
+        # Reserve some headroom; cap to fraction of TOTAL (safer than free)
+        cap = int(total * frac)
+        # Round down to nearest MiB -> GiB string
+        cap_gib = max(1, cap // (1024**3))
+        max_mem[i] = f"{cap_gib}GiB"
+    return max_mem
+
+
+def str2bool(x: Optional[str]) -> Optional[bool]:
+    if x is None:
+        return None
+    return x.lower() in ("1", "true", "t", "yes", "y")
+
+
+# ------------------------------
 # Custom Trainer with NO-OP device move
 # ------------------------------
 class KDTrainer(Trainer):
@@ -220,12 +257,11 @@ class KDTrainer(Trainer):
         self.T = float(T)
         self.alpha = float(alpha)
 
-    # CRITICAL: prevent Trainer from moving a sharded/meta-initialized model
-    # (avoids: "Cannot copy out of meta tensor; no data!")
+    # Prevent Trainer from relocating sharded/meta modules
     def _move_model_to_device(self, model, device):
         return model
 
-    # Accept **kwargs/num_items_in_batch to be compatible with new Trainer API
+    # Accept **kwargs/num_items_in_batch (HF>=4.45)
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
@@ -252,17 +288,25 @@ class KDTrainer(Trainer):
 # ------------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
+    # Numerics
     ap.add_argument("--bf16", type=str, default=None,
                     help="True/False to force bfloat16; default: auto if supported.")
     ap.add_argument("--fp16", type=str, default=None,
                     help="True/False to force float16; default: opposite of bf16 when CUDA.")
+    # Seq len override
+    ap.add_argument("--seq_len", type=int, default=None, help="Override seq_len from config.")
+    # Memory caps for device_map auto sharding
+    ap.add_argument("--max_memory_frac", type=float, default=float(os.environ.get("MAX_MEMORY_FRAC", 0.90)),
+                    help="Per-GPU total memory fraction cap for model loading (default 0.90).")
+    # Quantize TEACHER to save VRAM
+    ap.add_argument("--teacher_4bit", type=str, default="False",
+                    help="Quantize teacher in 4-bit (requires bitsandbytes).")
+    ap.add_argument("--teacher_8bit", type=str, default="False",
+                    help="Quantize teacher in 8-bit (requires bitsandbytes).")
+    # Logging
     ap.add_argument("--logging_steps", type=int, default=int(os.environ.get("LOGGING_STEPS", "20")))
     return ap.parse_args()
 
-def str2bool(x: Optional[str]) -> Optional[bool]:
-    if x is None:
-        return None
-    return x.lower() in ("1", "true", "t", "yes", "y")
 
 def main():
     args_cli = parse_args()
@@ -271,6 +315,9 @@ def main():
     P = cfg["paths"]
     M = cfg["models"]
     Tcfg = cfg["training"]
+
+    if args_cli.seq_len is not None:
+        Tcfg["seq_len"] = int(args_cli.seq_len)
 
     os.makedirs(P["outputs_dir"], exist_ok=True)
     os.makedirs(P["lora_dir"], exist_ok=True)
@@ -307,22 +354,59 @@ def main():
         else:
             use_fp16 = not use_bf16
     else:
-        use_bf16 = False
-        use_fp16 = False
+        use_bf16, use_fp16 = False, False
 
     dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
 
     # -------------------------
-    # Load Teacher & Student (sharded)
+    # Build max_memory map per GPU for model sharding
+    # -------------------------
+    max_memory = make_max_memory_map(frac=float(args_cli.max_memory_frac)) if torch.cuda.is_available() else None
+    if max_memory and len(max_memory) == 1:
+        # Single GPU visible — you will likely need teacher quantization to fit 70B
+        pass
+
+    # -------------------------
+    # Optional TEACHER quantization (saves VRAM significantly)
+    # -------------------------
+    teacher_kwargs = dict(
+        dtype=dtype,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        offload_state_dict=True,
+        max_memory=max_memory,
+    )
+
+    teacher_4bit = str2bool(args_cli.teacher_4bit)
+    teacher_8bit = str2bool(args_cli.teacher_8bit)
+
+    if (teacher_4bit or teacher_8bit) and not _HAS_BNB:
+        raise RuntimeError(
+            "You requested teacher 4/8-bit quantization but bitsandbytes is not installed. "
+            "Install it in your conda env (e.g., `pip install bitsandbytes`) or disable these flags."
+        )
+
+    if teacher_4bit:
+        teacher_kwargs.pop("dtype", None)  # handled by quantization config
+        teacher_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if use_bf16 else torch.float16,
+        )
+    elif teacher_8bit:
+        teacher_kwargs.pop("dtype", None)
+        teacher_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+
+    # -------------------------
+    # Load Teacher & Student (sharded / quantized if requested)
     # -------------------------
     print("Loading the WISE TEACHER:", M["teacher_id"])
     teacher = AutoModelForCausalLM.from_pretrained(
         M["teacher_id"],
-        dtype=dtype,                  # replaces deprecated torch_dtype
-        device_map="auto",
-        low_cpu_mem_usage=True,
-        offload_state_dict=True,
+        **teacher_kwargs,
     )
+
     print("Loading the SMART STUDENT:", M["student_id"])
     student = AutoModelForCausalLM.from_pretrained(
         M["student_id"],
@@ -330,6 +414,7 @@ def main():
         device_map="auto",
         low_cpu_mem_usage=True,
         offload_state_dict=True,
+        max_memory=max_memory,
     )
 
     # Enable grad checkpointing before PEFT to reduce activation memory
@@ -369,7 +454,6 @@ def main():
         os.path.join(P["data_dir"], "opencodeinstruct_python_train.jsonl"),
         os.path.join(P["data_dir"], "codesearchnet_python_train.jsonl"),
     ]
-    # Keep only files that exist and are non-empty
     data_files = [fp for fp in data_files if os.path.isfile(fp) and os.path.getsize(fp) > 0]
 
     ds = ChatJsonlReader(
@@ -384,8 +468,8 @@ def main():
 
     # -------------------------
     # TrainingArguments
-    #   NOTE: We DO NOT pass `place_model_on_device` (not available everywhere).
-    #         Our KDTrainer overrides `_move_model_to_device` to NO-OP instead.
+    #   NOTE: We DO NOT pass `place_model_on_device`. Our KDTrainer overrides
+    #         `_move_model_to_device` to a NO-OP (prevents meta-tensor crash).
     # -------------------------
     targs = TrainingArguments(
         output_dir=os.path.join(P["outputs_dir"], "llama31_8b_kd_lora"),
@@ -397,8 +481,8 @@ def main():
         logging_steps=int(args_cli.logging_steps),
         save_steps=500,
         save_total_limit=2,
-        bf16=use_bf16,
-        fp16=use_fp16,
+        bf16=(dtype == torch.bfloat16),
+        fp16=(dtype == torch.float16),
         gradient_checkpointing=True,
         optim="adamw_torch",
         weight_decay=0.01,
