@@ -1,31 +1,33 @@
-# src/train_kd.py
-# --------------------------------------------------------------------------------------
-# Knowledge Distillation with LoRA (Llama 3.1 70B -> 8B) for Python code generation
+# src/train_kid.py
+# =================================================================================================
+# Knowledge Distillation (KD) for Llama-3.1-8B (student) taught by Llama-3.1-70B (teacher)
 #
-# Major updates in this version:
-#   • Robust multi-GPU & low-memory loading:
-#       - Optional 4-bit/8-bit quantization for the TEACHER (70B) to avoid OOM
-#       - Auto “device_map=auto” with per-GPU max_memory caps
-#       - Safe no-op device move inside Trainer to avoid meta-tensor crash
-#   • Trainer compatibility with latest HF (accepts **kwargs/num_items_in_batch)
-#   • Collator returns plain dict (needed by Trainer internals)
-#   • CLI flags to control precision, seq_len, memory caps, quantization
+# Key features:
+#   • Multi-GPU safe: device_map="auto", per-GPU memory caps, no-op device move
+#   • Optional teacher quantization (4-bit / 8-bit) to avoid OOM
+#   • LoRA adapters for parameter-efficient student training (toggleable)
+#   • BF16/FP16 precision controls
+#   • Robust collator returning dict (Trainer-compatible)
+#   • KD loss = alpha * KL(student||teacher_T) * T^2 + (1-alpha) * CE(student,gold)
+#   • Optional MLflow GPU/power logging via LiteMLflowCallback
 #
-# Example (single GPU, bf16 if available):
-#   CUDA_VISIBLE_DEVICES=0 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kd --bf16 True
+# Example runs:
+#   # single GPU, BF16 if supported, LoRA on
+#   CUDA_VISIBLE_DEVICES=0 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kid --bf16 True
 #
-# Example (multi-GPU model sharding across 0,1,2,3; 4-bit teacher to save VRAM):
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 MAX_SAMPLES=5000 "$CONDA_PREFIX/bin/python" -u -m src.train_kd \
-#     --bf16 True --teacher_4bit True --max_memory_frac 0.90
+#   # multi-GPU sharding, teacher in 4-bit to save VRAM, LoRA off (full-param KD)
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kid \
+#     --bf16 True --teacher_4bit True --lora False --seq_len 1024 --max_memory_frac 0.90
 #
 # Requirements:
-#   transformers>=4.44, accelerate>=0.33, peft, (optional) bitsandbytes for 4/8-bit
-# --------------------------------------------------------------------------------------
+#   transformers>=4.44, accelerate>=0.33, peft
+#   bitsandbytes (only if using 4/8-bit)
+#   (optional) mlflow, pynvml + src/callbacks_mlflow.py for GPU/power logging
+# =================================================================================================
 
 from __future__ import annotations
 import os
 import json
-import math
 import random
 import warnings
 import argparse
@@ -44,22 +46,27 @@ from transformers import (
     TrainingArguments,
 )
 
-# Optional (only needed if you use 4/8-bit)
+# Optional bitsandbytes for 4/8-bit quantization
 try:
     from transformers import BitsAndBytesConfig
     _HAS_BNB = True
 except Exception:
     _HAS_BNB = False
 
-from peft import LoraConfig, get_peft_model, TaskType
+# Optional MLflow GPU/power logging callback (safe if missing)
+try:
+    from .callbacks_mlflow import LiteMLflowCallback
+    _HAS_MLFLOW_CB = True
+except Exception:
+    _HAS_MLFLOW_CB = False
 
-# Project helpers (expects ./configs/project.yaml and ./src/utils.py)
+# Project helpers
 from .utils import Config, build_chat_text
 
 
-# ------------------------------
-# Reproducibility & CUDA settings
-# ------------------------------
+# -------------------------------------------------------------------------------------------------
+# Reproducibility & CUDA allocator settings
+# -------------------------------------------------------------------------------------------------
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -67,35 +74,32 @@ def set_seed(seed: int = 42) -> None:
 
 set_seed(42)
 
-# Small speedups where possible
+# Modest speedup on Ampere+ (no-op elsewhere)
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-# Helpful to reduce fragmentation on long runs
+# Reduce fragmentation on long runs
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# Respect custom cache dirs if set
+# Respect custom HF caches if provided
 for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
     v = os.environ.get(env_var)
     if v:
         os.makedirs(v, exist_ok=True)
 
 
-# ------------------------------
-# Lightweight JSONL reader
-# ------------------------------
+# -------------------------------------------------------------------------------------------------
+# Lightweight JSONL reader (O(1) memory with byte offsets)
+# -------------------------------------------------------------------------------------------------
 class ChatJsonlReader(Dataset):
     """
-    Memory-light dataset:
-      - Builds an index of byte offsets (file, offset) across N JSONL files
-      - __getitem__ seeks and reads one line only (O(1) memory)
-      - Optional MAX_SAMPLES limit via env var or constructor
+    Builds an index of (file_path, byte_offset). __getitem__ seeks and reads one JSON line.
+    Set MAX_SAMPLES (env or arg) to cap data volume when testing.
     """
-
     def __init__(self, files: List[str], max_samples: Optional[int] = None):
-        self.index: List[Tuple[str, int]] = []  # (file_path, byte_offset)
+        self.index: List[Tuple[str, int]] = []
         total = 0
         for fp in files:
             if not os.path.isfile(fp):
@@ -125,22 +129,21 @@ class ChatJsonlReader(Dataset):
         return json.loads(raw.decode("utf-8"))
 
 
-# ------------------------------
-# Collator: chats -> tokenized tensors -> labels
-# ------------------------------
+# -------------------------------------------------------------------------------------------------
+# Collator: format chats -> tokenize -> pad -> labels
+# -------------------------------------------------------------------------------------------------
 class CausalCollator:
     """
-    Converts chat messages to Llama-3 chat format, tokenizes, pads, and builds labels.
-    Returns a PLAIN DICT so `transformers.Trainer` can consume it directly.
+    Converts list of {messages:[...]} into Llama-3 chat text, tokenizes, pads,
+    and produces labels (-100 on pad positions) for language modeling loss.
+    Returns a plain dict compatible with transformers.Trainer.
     """
-
     def __init__(self, tokenizer: PreTrainedTokenizerBase, max_seq_len: int):
         self.tok = tokenizer
         self.max_len = max_seq_len
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         texts = [build_chat_text(ex["messages"]) for ex in features]
-
         enc = self.tok(
             texts,
             padding=True,
@@ -148,27 +151,24 @@ class CausalCollator:
             max_length=self.max_len,
             return_tensors="pt",
         )
-
         input_ids = enc["input_ids"]
         attention_mask = enc["attention_mask"]
 
-        # Supervise all non-pad tokens (ignore padding with -100)
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
+        labels[attention_mask == 0] = -100  # ignore pad on loss
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
-# ------------------------------
+# -------------------------------------------------------------------------------------------------
 # KD helpers (next-token alignment)
-# ------------------------------
-def shift_for_next_token(
+# -------------------------------------------------------------------------------------------------
+def _shift_for_next_token(
     logits: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Align teacher/student token predictions with the next-token targets.
+    """
     s_logits = logits[:, :-1, :]
     labels_shifted = labels[:, 1:]
     attn_shifted = attention_mask[:, 1:]
@@ -185,13 +185,15 @@ def kd_loss(
     alpha: float = 0.5,
 ) -> torch.Tensor:
     """
-    loss = alpha * KL( student || teacher_T ) * T^2  +  (1 - alpha) * CE(student, gold)
+    Knowledge Distillation loss:
+      L = alpha * KL( student || teacher_T ) * T^2 + (1 - alpha) * CE(student, gold)
     """
-    s_next, gold, valid_mask = shift_for_next_token(s_logits, labels, attention_mask)
-    t_next, _, _ = shift_for_next_token(t_logits, labels, attention_mask)
+    s_next, gold, valid_mask = _shift_for_next_token(s_logits, labels, attention_mask)
+    t_next, _, _ = _shift_for_next_token(t_logits, labels, attention_mask)
 
     idx = valid_mask.view(-1)
     if idx.sum().item() == 0:
+        # No valid tokens in this small batch; return zero to keep training loop happy
         return torch.zeros([], device=s_logits.device, dtype=s_logits.dtype)
 
     s_sel = s_next.view(-1, s_next.size(-1))[idx]
@@ -208,26 +210,23 @@ def kd_loss(
     return alpha * kl + (1.0 - alpha) * ce
 
 
-# ------------------------------
-# Memory helpers
-# ------------------------------
-def make_max_memory_map(frac: float = 0.9) -> Dict[int, str]:
+# -------------------------------------------------------------------------------------------------
+# Utilities
+# -------------------------------------------------------------------------------------------------
+def make_max_memory_map(frac: float = 0.90) -> Dict[int, str]:
     """
-    Build a max_memory map per visible GPU using a fraction of *currently free* memory.
-    This helps Accelerate/HF shard large models safely across multiple GPUs.
-
-    Returns e.g. {0: '70GiB', 1: '70GiB'} strings as expected by HF loaders.
+    Build a HuggingFace-compatible per-GPU max_memory dict using FRACTION of TOTAL memory.
+    Example return: {0: "70GiB", 1: "70GiB", ...}
     """
     max_mem = {}
     if not torch.cuda.is_available():
         return max_mem
     n = torch.cuda.device_count()
     for i in range(n):
-        free, total = torch.cuda.mem_get_info(i)  # bytes
-        # Reserve some headroom; cap to fraction of TOTAL (safer than free)
+        # Use total*frac (safer than "free" which can be near-zero during loading)
+        total = torch.cuda.get_device_properties(i).total_memory  # bytes
         cap = int(total * frac)
-        # Round down to nearest MiB -> GiB string
-        cap_gib = max(1, cap // (1024**3))
+        cap_gib = max(1, cap // (1024 ** 3))
         max_mem[i] = f"{cap_gib}GiB"
     return max_mem
 
@@ -238,17 +237,14 @@ def str2bool(x: Optional[str]) -> Optional[bool]:
     return x.lower() in ("1", "true", "t", "yes", "y")
 
 
-# ------------------------------
-# Custom Trainer with NO-OP device move
-# ------------------------------
+# -------------------------------------------------------------------------------------------------
+# Custom Trainer (no-op device move; teacher forward under no_grad; accepts **kwargs)
+# -------------------------------------------------------------------------------------------------
 class KDTrainer(Trainer):
     """
-    Trainer that:
-      - Keeps model placement as loaded by device_map="auto" (NO .to(device) calls)
-      - Runs teacher in no_grad
-      - Computes KD loss
+    - Prevents Trainer from relocating model (important for device_map="auto" sharded models)
+    - Computes KD loss by running teacher forward with no_grad
     """
-
     def __init__(self, *args, teacher: nn.Module, T: float, alpha: float, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher = teacher.eval()
@@ -257,11 +253,11 @@ class KDTrainer(Trainer):
         self.T = float(T)
         self.alpha = float(alpha)
 
-    # Prevent Trainer from relocating sharded/meta modules
+    # Avoid meta-tensor crash by not moving model away from HF/Accelerate placement
     def _move_model_to_device(self, model, device):
         return model
 
-    # Accept **kwargs/num_items_in_batch (HF>=4.45)
+    # Newer HF may pass extra kwargs (e.g., num_items_in_batch); accept **kwargs
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
@@ -273,44 +269,54 @@ class KDTrainer(Trainer):
             t_out = self.teacher(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
         loss = kd_loss(
-            s_out.logits,
-            t_out.logits,
-            labels,
-            attention_mask,
-            T=self.T,
-            alpha=self.alpha,
+            s_out.logits, t_out.logits, labels, attention_mask,
+            T=self.T, alpha=self.alpha
         )
         return (loss, s_out) if return_outputs else loss
 
 
-# ------------------------------
-# CLI + main
-# ------------------------------
+# -------------------------------------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser()
-    # Numerics
+    ap = argparse.ArgumentParser(description="Train student with KD from teacher (Llama3.1)")
+
+    # Precision
     ap.add_argument("--bf16", type=str, default=None,
                     help="True/False to force bfloat16; default: auto if supported.")
     ap.add_argument("--fp16", type=str, default=None,
                     help="True/False to force float16; default: opposite of bf16 when CUDA.")
-    # Seq len override
+
+    # Sequence length override
     ap.add_argument("--seq_len", type=int, default=None, help="Override seq_len from config.")
-    # Memory caps for device_map auto sharding
+
+    # Memory & quantization
     ap.add_argument("--max_memory_frac", type=float, default=float(os.environ.get("MAX_MEMORY_FRAC", 0.90)),
                     help="Per-GPU total memory fraction cap for model loading (default 0.90).")
-    # Quantize TEACHER to save VRAM
     ap.add_argument("--teacher_4bit", type=str, default="False",
                     help="Quantize teacher in 4-bit (requires bitsandbytes).")
     ap.add_argument("--teacher_8bit", type=str, default="False",
                     help="Quantize teacher in 8-bit (requires bitsandbytes).")
-    # Logging
+
+    # LoRA toggle
+    ap.add_argument("--lora", type=str, default="True",
+                    help="Use LoRA adapters for student (True/False). If False = full-parameter KD.")
+
+    # Logging & callbacks
     ap.add_argument("--logging_steps", type=int, default=int(os.environ.get("LOGGING_STEPS", "20")))
+    ap.add_argument("--use_mlflow_cb", type=str, default="True",
+                    help="Attach MLflow GPU/power callback if available (True/False).")
+
     return ap.parse_args()
 
 
+# -------------------------------------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------------------------------------
 def main():
     args_cli = parse_args()
 
+    # Load project config
     cfg = Config.load().cfg
     P = cfg["paths"]
     M = cfg["models"]
@@ -322,7 +328,7 @@ def main():
     os.makedirs(P["outputs_dir"], exist_ok=True)
     os.makedirs(P["lora_dir"], exist_ok=True)
 
-    MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "0"))  # 0 = use all rows
+    MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "0"))  # 0 => all samples
 
     # -------------------------
     # Tokenizer
@@ -332,7 +338,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # -------------------------
-    # Numerics (bf16/fp16 selection)
+    # Precision selection
     # -------------------------
     if torch.cuda.is_available():
         auto_bf16 = torch.cuda.is_bf16_supported()
@@ -359,18 +365,15 @@ def main():
     dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
 
     # -------------------------
-    # Build max_memory map per GPU for model sharding
+    # Per-GPU max_memory caps for safe sharding
     # -------------------------
     max_memory = make_max_memory_map(frac=float(args_cli.max_memory_frac)) if torch.cuda.is_available() else None
-    if max_memory and len(max_memory) == 1:
-        # Single GPU visible — you will likely need teacher quantization to fit 70B
-        pass
 
     # -------------------------
-    # Optional TEACHER quantization (saves VRAM significantly)
+    # Teacher loader kwargs (with optional quantization)
     # -------------------------
     teacher_kwargs = dict(
-        dtype=dtype,
+        dtype=dtype,                     # use dtype unless quantized
         device_map="auto",
         low_cpu_mem_usage=True,
         offload_state_dict=True,
@@ -382,30 +385,27 @@ def main():
 
     if (teacher_4bit or teacher_8bit) and not _HAS_BNB:
         raise RuntimeError(
-            "You requested teacher 4/8-bit quantization but bitsandbytes is not installed. "
-            "Install it in your conda env (e.g., `pip install bitsandbytes`) or disable these flags."
+            "Requested teacher 4/8-bit quantization but bitsandbytes is not installed. "
+            "Install it (pip install bitsandbytes) or disable the flags."
         )
 
     if teacher_4bit:
-        teacher_kwargs.pop("dtype", None)  # handled by quantization config
+        teacher_kwargs.pop("dtype", None)
         teacher_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16 if use_bf16 else torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16 if dtype == torch.bfloat16 else torch.float16,
         )
     elif teacher_8bit:
         teacher_kwargs.pop("dtype", None)
         teacher_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
 
     # -------------------------
-    # Load Teacher & Student (sharded / quantized if requested)
+    # Load TEACHER (70B) & STUDENT (8B)
     # -------------------------
     print("Loading the WISE TEACHER:", M["teacher_id"])
-    teacher = AutoModelForCausalLM.from_pretrained(
-        M["teacher_id"],
-        **teacher_kwargs,
-    )
+    teacher = AutoModelForCausalLM.from_pretrained(M["teacher_id"], **teacher_kwargs)
 
     print("Loading the SMART STUDENT:", M["student_id"])
     student = AutoModelForCausalLM.from_pretrained(
@@ -417,25 +417,27 @@ def main():
         max_memory=max_memory,
     )
 
-    # Enable grad checkpointing before PEFT to reduce activation memory
+    # Reduce activation memory
     if hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
 
     # -------------------------
-    # LoRA config
+    # LoRA (optional)
     # -------------------------
-    lcfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        bias="none",
-    )
-    student = get_peft_model(student, lcfg)
+    use_lora = str2bool(args_cli.lora) if args_cli.lora is not None else True
+    if use_lora:
+        from peft import LoraConfig, get_peft_model, TaskType
+        lcfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            bias="none",
+        )
+        student = get_peft_model(student, lcfg)
+    else:
+        print("LoRA disabled → full-parameter KD fine-tune. Expect much higher VRAM usage.")
 
     # Info: trainable vs total params
     trainable, total = 0, 0
@@ -461,18 +463,16 @@ def main():
         max_samples=(MAX_SAMPLES if MAX_SAMPLES > 0 else None),
     )
     if len(ds) == 0:
-        raise FileNotFoundError(
-            "No learning materials found! Run data_prep.py to build JSONL data first."
-        )
+        raise FileNotFoundError("No training JSONL found. Run: python -m src.data_prep")
+
     collator = CausalCollator(tokenizer, max_seq_len=Tcfg["seq_len"])
 
     # -------------------------
     # TrainingArguments
-    #   NOTE: We DO NOT pass `place_model_on_device`. Our KDTrainer overrides
-    #         `_move_model_to_device` to a NO-OP (prevents meta-tensor crash).
     # -------------------------
+    out_dir = os.path.join(P["outputs_dir"], "llama31_8b_kd_lora" if use_lora else "llama31_8b_kd_full")
     targs = TrainingArguments(
-        output_dir=os.path.join(P["outputs_dir"], "llama31_8b_kd_lora"),
+        output_dir=out_dir,
         num_train_epochs=Tcfg["epochs"],
         per_device_train_batch_size=Tcfg["per_device_batch_size"],
         gradient_accumulation_steps=Tcfg["grad_accum"],
@@ -487,24 +487,30 @@ def main():
         optim="adamw_torch",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
-        report_to=[],                # no external logging
+        report_to=[],                # no external logging integrations by default
         dataloader_num_workers=2,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False, # safer for custom collators/LMs
     )
 
     # -------------------------
-    # Trainer
+    # Trainer (attach MLflow callback if available & requested)
     # -------------------------
+    callbacks = []
+    use_cb = str2bool(args_cli.use_mlflow_cb) if args_cli.use_mlflow_cb is not None else True
+    if use_cb and _HAS_MLFLOW_CB:
+        callbacks.append(LiteMLflowCallback(log_gpu_every_n_steps=int(args_cli.logging_steps)))
+
     trainer = KDTrainer(
         model=student,
         args=targs,
         train_dataset=ds,
         data_collator=collator,
-        tokenizer=tokenizer,  # deprecation warning is harmless for now
+        tokenizer=tokenizer,  # deprecation warning okay; HF keeps backwards compat
         teacher=teacher,
         T=float(Tcfg.get("kd_temp", 1.0)),
         alpha=float(Tcfg.get("kd_alpha", 0.5)),
+        callbacks=callbacks,
     )
 
     # -------------------------
@@ -513,12 +519,13 @@ def main():
     trainer.train()
 
     # -------------------------
-    # Save LoRA adapters (and tokenizer)
+    # Save (LoRA adapters OR full model) + tokenizer
     # -------------------------
-    print("Saving the student's knowledge to:", P["lora_dir"])
-    student.save_pretrained(P["lora_dir"])
-    tokenizer.save_pretrained(P["lora_dir"])
-    print("✅ Great success! The student has learned well.")
+    save_dir = P["lora_dir"] if use_lora else out_dir
+    print("Saving the student's knowledge to:", save_dir)
+    student.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    print("✅ Distillation complete.")
 
 
 if __name__ == "__main__":
