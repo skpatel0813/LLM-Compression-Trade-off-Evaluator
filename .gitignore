@@ -25,3 +25,9 @@ reports/*.jsonl
 .DS_Store
 Thumbs.db
 .vscode/
+
+# local artifacts
+hf_cache_isolated/
+mlflow_ui.log
+spate336*
+src/eval_codebleu_mlflow.py.bak*
