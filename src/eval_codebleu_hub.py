@@ -1,16 +1,20 @@
 # src/eval_codebleu_hub.py
 # --------------------------------------------------------------------------------------------------
-# Baseline evaluation (no KD / no LoRA) with CodeBLEU + BLEU-4
-# - Loads a base model (e.g., meta-llama/Meta-Llama-3.1-8B-Instruct)
-# - Reads JSONL eval data where each line has: {"messages": [...]}
-#   * We assume the LAST assistant message is the reference answer (gold).
-#   * The prompt is all earlier messages (user/assistant) up to that reference, formatted
-#     via utils.build_chat_text so it matches Llama-3 chat templates.
-# - Generates predictions, computes BLEU-4 and CodeBLEU, captures GPU telemetry & wall-time.
-# - Saves artifacts locally and uploads to a Hugging Face Dataset repo in a run subfolder.
+# Evaluate a (base or LoRA-merged) model on JSONL chat data and push results to Hugging Face Hub.
+#
+# What you get per run (stored under outputs/eval/<run_name>/ and uploaded to the Hub):
+#   - predictions_eval.jsonl      : each row has {"prompt", "ref", "hyp"}
+#   - metrics_eval.json           : {"model", "rows", "bleu4", "codebleu", "...subscores", "dtype", "wall_time_sec"}
+#   - gpu_trace.csv               : timestamp,gpu,util%,mem_used_MB,mem_total_MB,power_W (sampled each second)
+#
+# Key features:
+#   - Works with Llama-3.x etc. via HF Transformers
+#   - Optional LoRA merge (materialize adapters before eval)
+#   - Robust CodeBLEU via a shim that uses tree_sitter_languages (no fragile per-lang wheels)
+#   - Push artifacts to a Hugging Face *dataset* repo (recommended) with a simple folder layout
 #
 # Usage example:
-#   env HUGGINGFACE_HUB_TOKEN=hf_*** \
+#   export HUGGINGFACE_HUB_TOKEN=hf_xxx
 #   CUDA_VISIBLE_DEVICES=0 "$CONDA_PREFIX/bin/python" -u -m src.eval_codebleu_hub \
 #     --base_id_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
 #     --eval_files data/codesearchnet_python_train.jsonl \
@@ -18,513 +22,385 @@
 #     --seq_len 2048 \
 #     --max_new_tokens 256 \
 #     --bf16 True \
-#     --hub_repo_id "skpatel0813/llm-kd-evals" \
+#     --hub_repo_id "username/llm-kd-evals" \
 #     --run_name "baseline-8B-noKD"
 #
-# Notes:
-# - No quantization flags here: this is a *baseline* evaluator.
-# - If your CodeBLEU install differs, the robust wrapper below adapts automatically.
-# - If sacrebleu is unavailable, we fall back to nltk BLEU-4 (with smoothing).
+# Requirements in your env:
+#   pip install -U transformers sacrebleu codebleu tree_sitter_languages huggingface_hub pynvml peft
 # --------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
-
-import os
-import io
-import re
-import gc
-import sys
-import json
-import time
-import math
 import argparse
-import datetime as dt
-from typing import Dict, List, Any, Tuple, Optional
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Project helper (builds model-specific chat text)
-try:
-    from .utils import build_chat_text
-except Exception:
-    # Minimal fallback: if utils is not available, concatenate roles plainly.
-    def build_chat_text(messages: List[Dict[str, str]]) -> str:
-        out = []
-        for m in messages:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            out.append(f"[{role.upper()}]\n{content}\n")
-        out.append("[ASSISTANT]\n")
-        return "\n".join(out)
+# IMPORTANT: Make CodeBLEU work with tree_sitter_languages before importing calc_codebleu
+# This file must exist at src/codebleu_shim.py (provided separately)
+import src.codebleu_shim  # noqa: F401  (monkey-patches codebleu internals)
+from codebleu import calc_codebleu
+import sacrebleu
 
-# ----------------------------- Robust CodeBLEU import & wrapper -----------------------------
-# We try multiple module names/APIs used across CodeBLEU releases.
-try:
-    from codebleu import calc_codebleu as _codebleu_api  # common path
-    _HAS_CODEBLEU = True
-except Exception:
-    try:
-        from codebleu import calc_code_bleu as _codebleu_api  # alt name in some forks
-        _HAS_CODEBLEU = True
-    except Exception:
-        _codebleu_api = None
-        _HAS_CODEBLEU = False
-
-
-def compute_codebleu(refs: List[str], hyps: List[str], lang: str = "python") -> Dict[str, float]:
-    """
-    Returns a dict:
-      codebleu, codebleu_ngram, codebleu_weighted_ngram, codebleu_syntax, codebleu_dataflow
-    Falls back to {} if CodeBLEU is not available or fails.
-    """
-    if _codebleu_api is None:
-        return {}
-    try:
-        # API variant A: module with .get_codebleu(...)
-        if hasattr(_codebleu_api, "get_codebleu"):
-            ngram, w_ngram, syntax, dataflow, overall = _codebleu_api.get_codebleu(hyps, refs, lang)
-            return {
-                "codebleu": float(overall),
-                "codebleu_ngram": float(ngram),
-                "codebleu_weighted_ngram": float(w_ngram),
-                "codebleu_syntax": float(syntax),
-                "codebleu_dataflow": float(dataflow),
-            }
-
-        # API variant B: callable returning a tuple or dict
-        if callable(_codebleu_api):
-            out = _codebleu_api(hyps, refs, lang)  # try direct call
-            if isinstance(out, dict) and "codebleu" in out:
-                return {
-                    "codebleu": float(out["codebleu"]),
-                    "codebleu_ngram": float(out.get("ngram", out.get("ngram_match", 0.0))),
-                    "codebleu_weighted_ngram": float(out.get("weighted_ngram", out.get("weighted_ngram_match", 0.0))),
-                    "codebleu_syntax": float(out.get("syntax", out.get("syntax_match", 0.0))),
-                    "codebleu_dataflow": float(out.get("dataflow", out.get("dataflow_match", 0.0))),
-                }
-            if isinstance(out, (list, tuple)) and len(out) == 5:
-                ngram, w_ngram, syntax, dataflow, overall = out
-                return {
-                    "codebleu": float(overall),
-                    "codebleu_ngram": float(ngram),
-                    "codebleu_weighted_ngram": float(w_ngram),
-                    "codebleu_syntax": float(syntax),
-                    "codebleu_dataflow": float(dataflow),
-                }
-    except Exception:
-        pass
-    return {}
-
-# ----------------------------- BLEU-4 (sacrebleu preferred, else nltk) -----------------------------
-try:
-    import sacrebleu
-    _HAS_SACREBLEU = True
-except Exception:
-    _HAS_SACREBLEU = False
-
-try:
-    # nltk BLEU-4 fallback
-    import nltk
-
-    try:
-        from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-    except Exception:
-        corpus_bleu, SmoothingFunction = None, None
-    _HAS_NLTK = corpus_bleu is not None
-except Exception:
-    _HAS_NLTK = False
-
-
-def compute_bleu4(refs: List[str], hyps: List[str]) -> float:
-    """
-    Returns corpus BLEU-4. Uses sacrebleu if available (recommended),
-    else falls back to nltk BLEU-4 with smoothing.
-    """
-    if _HAS_SACREBLEU:
-        # sacrebleu expects: list of sys outputs, list of list of references
-        # Here we have exactly one reference per hypothesis.
-        bleu = sacrebleu.corpus_bleu(hyps, [refs])
-        return float(bleu.score)
-
-    if _HAS_NLTK:
-        # Tokenize simply by whitespace; apply smoothing to avoid zero scores
-        smoothie = SmoothingFunction().method1
-        # nltk expects tokenized lists
-        refs_tok = [[r.split()] for r in refs]  # list of list-of-refs
-        hyps_tok = [h.split() for h in hyps]
-        score = corpus_bleu(refs_tok, hyps_tok, smoothing_function=smoothie, weights=(0.25, 0.25, 0.25, 0.25))
-        return float(score * 100.0)  # to match sacrebleu's percentage scale
-    return float("nan")
-
-# ----------------------------- GPU telemetry (optional) -----------------------------
-_GPU_OK = False
-try:
-    # Prefer modern package; if only pynvml exists, we still use it
-    try:
-        import nvidia_ml_py3 as _nvml  # type: ignore
-        _GPU_OK = True
-    except Exception:
-        import pynvml as _nvml  # type: ignore
-        _GPU_OK = True
-except Exception:
-    _GPU_OK = False
-
-
-def snapshot_gpu() -> Dict[str, Any]:
-    """
-    Capture per-GPU telemetry: util %, mem GiB used/total, power W, temp C.
-    Returns a dict with summary + per_device stats. Safe if no GPUs.
-    """
-    out = {"has_gpu": torch.cuda.is_available(), "num_devices": torch.cuda.device_count(), "devices": []}
-    if not (out["has_gpu"] and _GPU_OK):
-        return out
-
-    try:
-        _nvml.nvmlInit()
-        for i in range(torch.cuda.device_count()):
-            handle = _nvml.nvmlDeviceGetHandleByIndex(i)
-            name = _nvml.nvmlDeviceGetName(handle).decode("utf-8") if hasattr(_nvml, "nvmlDeviceGetName") else str(
-                torch.cuda.get_device_name(i)
-            )
-            util = _nvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = _nvml.nvmlDeviceGetMemoryInfo(handle)
-            power = None
-            temp = None
-            try:
-                power = _nvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # W
-            except Exception:
-                pass
-            try:
-                temp = _nvml.nvmlDeviceGetTemperature(handle, 0)  # 0 = GPU
-            except Exception:
-                pass
-            out["devices"].append(
-                {
-                    "index": i,
-                    "name": name,
-                    "util_percent": getattr(util, "gpu", None),
-                    "mem_used_gib": round(mem.used / (1024**3), 3),
-                    "mem_total_gib": round(mem.total / (1024**3), 3),
-                    "power_w": power,
-                    "temp_c": temp,
-                }
-            )
-    except Exception:
-        pass
-    finally:
-        try:
-            _nvml.nvmlShutdown()
-        except Exception:
-            pass
-    return out
-
-# ----------------------------- HF Hub helpers -----------------------------
 from huggingface_hub import HfApi, HfFolder, create_repo, upload_file
 
+# Optional LoRA support (merge adapters into base weights)
+try:
+    from peft import PeftModel
+    _HAS_PEFT = True
+except Exception:
+    _HAS_PEFT = False
 
-def hf_make_run_dir(repo_id: str, run_name: str) -> str:
-    stamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    safe_run = re.sub(r"[^A-Za-z0-9._-]+", "-", run_name).strip("-")
-    return f"runs/{stamp}-{safe_run}"
-
-
-def hf_upload_run(repo_id: str, local_files: Dict[str, str], run_dir: str, repo_type: str = "dataset") -> None:
-    """
-    Upload multiple local files into subpaths under the hub repo.
-    local_files: {hub_subpath: local_path}
-    """
-    token = HfFolder.get_token()
-    if not token:
-        raise RuntimeError(
-            "No Hugging Face token found. Set HUGGINGFACE_HUB_TOKEN or run `huggingface-cli login`."
-        )
-
-    # Ensure repo exists
-    create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True, token=token)
-
-    # Upload each file
-    for hub_subpath, local_path in local_files.items():
-        upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=f"{run_dir}/{hub_subpath}",
-            repo_id=repo_id,
-            repo_type=repo_type,
-            token=token,
-            commit_message=f"Upload {hub_subpath}",
-        )
-
-    # Also drop a tiny README index for the run
-    readme = f"# Evaluation Run: `{run_dir}`\n\nFiles:\n" + "\n".join(
-        [f"- `{hub_subpath}`" for hub_subpath in local_files.keys()]
-    ) + "\n"
-    upload_file(
-        path_or_fileobj=io.BytesIO(readme.encode("utf-8")),
-        path_in_repo=f"{run_dir}/README.md",
-        repo_id=repo_id,
-        repo_type=repo_type,
-        token=token,
-        commit_message="Add run README",
-    )
-
-# ----------------------------- Data loading -----------------------------
-def read_jsonl(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if not line.strip():
-                continue
-            rows.append(json.loads(line))
-            if limit and len(rows) >= limit:
-                break
-    return rows
+# Lightweight NVML sampler (provided separately at src/gpu_monitor.py)
+from src.gpu_monitor import GPUMonitor
 
 
-def build_prompt_and_ref(messages: List[Dict[str, str]]) -> Tuple[str, str]:
-    """
-    Given a chat with an 'assistant' final message (reference), create:
-      - prompt: all messages up to BEFORE the last assistant
-      - ref: the last assistant's content
-    """
-    if not messages:
-        return "", ""
-    # Find the last assistant as the reference
-    last_ass_idx = None
-    for idx in reversed(range(len(messages))):
-        if messages[idx].get("role") == "assistant":
-            last_ass_idx = idx
-            break
-    if last_ass_idx is None:
-        # No assistant target; treat entire thread as prompt, empty ref.
-        return build_chat_text(messages), ""
-
-    ref = messages[last_ass_idx].get("content", "")
-    prompt_msgs = messages[: last_ass_idx]  # everything before that assistant
-    prompt = build_chat_text(prompt_msgs)
-    return prompt, ref
-
-# ----------------------------- Model loading -----------------------------
-def load_model_and_tokenizer(
-    base_id_or_path: str,
-    use_bf16: bool = False,
-    use_fp16: bool = False,
-    seq_len: int = 2048,
-):
-    tok = AutoTokenizer.from_pretrained(base_id_or_path, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
-
-    model = AutoModelForCausalLM.from_pretrained(
-        base_id_or_path,
-        device_map="auto",   # shard across visible GPUs automatically
-        low_cpu_mem_usage=True,
-        torch_dtype=dtype if dtype is not torch.float32 else None,  # prefer dtype arg (transforms will map)
-    )
-
-    # If the model supports it, enable gradient checkpointing OFF (we're evaluating)
-    if hasattr(model, "gradient_checkpointing_disable"):
-        try:
-            model.gradient_checkpointing_disable()
-        except Exception:
-            pass
-
-    return tok, model
-
-# ----------------------------- CLI & main -----------------------------
+# ---------------------------------------
+# Small helpers
+# ---------------------------------------
 def str2bool(x: Optional[str]) -> Optional[bool]:
     if x is None:
         return None
     return x.lower() in ("1", "true", "t", "yes", "y")
 
 
+def load_jsonl(fp: str, max_rows: int) -> List[Dict[str, Any]]:
+    rows = []
+    with open(fp, "r", encoding="utf-8") as f:
+        for _line_idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+            if 0 < max_rows <= len(rows):
+                break
+    return rows
+
+
+def extract_prompt_and_ref(tokenizer, ex: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, str]]]:
+    """
+    Expect JSONL lines of the shape:
+      {"messages": [{"role": "user"/"assistant"/"system", "content": "..."} , ...]}
+
+    We use tokenizer.apply_chat_template(messages, add_generation_prompt=True) to build the prompt.
+    The reference 'ref' is considered the last assistant message (if present).
+    """
+    msgs: List[Dict[str, str]] = ex.get("messages", [])
+    if not msgs:
+        # Fallback: accept single-field examples
+        user = ex.get("user", "") or ex.get("prompt", "")
+        msgs = [{"role": "user", "content": user}]
+
+    ref = ""
+    if msgs and msgs[-1]["role"] == "assistant":
+        ref = msgs[-1]["content"]
+        msgs_for_prompt = msgs[:-1]
+    else:
+        msgs_for_prompt = msgs
+
+    prompt = tokenizer.apply_chat_template(
+        msgs_for_prompt,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return prompt, ref, msgs_for_prompt
+
+
+def maybe_merge_lora(model, lora_dir: Optional[str]) -> Any:
+    """
+    If a LoRA adapter dir is specified, load and try to merge it into the base model.
+    If merge is unsupported, we still return a PEFT-wrapped model and proceed.
+    """
+    if not lora_dir:
+        return model
+    if not _HAS_PEFT:
+        raise RuntimeError("Requested LoRA merge but `peft` is not installed.")
+    model = PeftModel.from_pretrained(model, lora_dir)
+    try:
+        model = model.merge_and_unload()
+    except Exception:
+        # Keep as PEFT wrapper if not mergeable
+        pass
+    return model
+
+
+def load_model_and_tokenizer(
+    base_id_or_path: str,
+    lora_dir: Optional[str],
+    bf16: Optional[bool],
+    fp16: Optional[bool],
+    seq_len: int,
+) -> Tuple[Any, Any, torch.dtype]:
+    """
+    Load tokenizer + model with auto device_map and selected dtype (bf16/fp16/fp32).
+    Optionally merge LoRA adapters into the base model.
+    """
+    if torch.cuda.is_available():
+        auto_bf16 = torch.cuda.is_bf16_supported()
+        use_bf16 = bf16 if bf16 is not None else auto_bf16
+        use_fp16 = (fp16 if fp16 is not None else not use_bf16)
+    else:
+        use_bf16 = use_fp16 = False
+
+    dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
+
+    tok = AutoTokenizer.from_pretrained(base_id_or_path, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.model_max_length = seq_len
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_id_or_path,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        dtype=dtype,
+    )
+    model = maybe_merge_lora(model, lora_dir)
+    return tok, model, dtype
+
+
+def generate_batch(
+    tokenizer, model, prompts: List[str], max_new_tokens: int, do_sample: bool, top_p: float, temperature: float
+) -> List[str]:
+    """
+    Tokenize prompts, generate, and return only the continuation (strip prompt prefix).
+    """
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+    )
+    enc = {k: v.to(model.device) for k, v in enc.items()}
+
+    with torch.no_grad():
+        out = model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            top_p=top_p,
+            temperature=temperature,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
+    results: List[str] = []
+    for prompt, full in zip(prompts, decoded):
+        if full.startswith(prompt):
+            results.append(full[len(prompt):].lstrip())
+        else:
+            results.append(full)
+    return results
+
+
+def compute_bleu4(refs: List[str], hyps: List[str]) -> float:
+    """
+    BLEU-4 via SacreBLEU. (one reference per hypothesis)
+    """
+    bleu = sacrebleu.corpus_bleu(hyps, [refs], force=True, tokenize="intl")
+    return float(bleu.score)
+
+
+def compute_codebleu_scores(refs: List[str], hyps: List[str], lang: str = "python") -> Dict[str, float]:
+    """
+    CodeBLEU (overall + sub-scores) using patched codebleu (see codebleu_shim.py).
+    Returns dict with keys:
+      - codebleu
+      - codebleu_ngram
+      - codebleu_weighted_ngram
+      - codebleu_syntax
+      - codebleu_dataflow
+    """
+    out = calc_codebleu(refs, hyps, lang=lang)
+    return {
+        "codebleu": float(out["codebleu"]),
+        "codebleu_ngram": float(out["ngram_match"]),
+        "codebleu_weighted_ngram": float(out["weighted_ngram_match"]),
+        "codebleu_syntax": float(out["syntax_match"]),
+        "codebleu_dataflow": float(out["dataflow_match"]),
+    }
+
+
+def ensure_hf_token(token: Optional[str]) -> str:
+    tok = token or os.environ.get("HUGGINGFACE_HUB_TOKEN") or HfFolder.get_token()
+    if not tok:
+        raise RuntimeError("Missing Hugging Face token. Set HUGGINGFACE_HUB_TOKEN or use --hf_token.")
+    return tok
+
+
+def hf_upload_dir(repo_id: str, run_dir: str, local_dir: str, token: str):
+    """
+    Upload all files under `local_dir` into the dataset repo `repo_id` at path `run_dir/..`.
+    If the dataset repo does not exist, create it (if it's actually a model repo, uploads still proceed).
+    """
+    api = HfApi()
+    try:
+        create_repo(repo_id, token=token, repo_type="dataset", exist_ok=True)
+    except Exception:
+        # Repo might already exist as a model repo, still fine to upload
+        pass
+
+    for root, _, files in os.walk(local_dir):
+        for fn in files:
+            local_path = os.path.join(root, fn)
+            repo_path = f"{run_dir}/{os.path.relpath(local_path, local_dir)}"
+            upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=repo_path,
+                repo_id=repo_id,
+                token=token,
+                repo_type="dataset",
+            )
+
+
+# ---------------------------------------
+# CLI
+# ---------------------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base_id_or_path", required=True, type=str, help="Model id or local path.")
-    ap.add_argument("--lora_dir", type=str, default=None, help="(Optional) LoRA adapters to merge for eval.")
-    ap.add_argument("--eval_files", required=True, nargs="+", help="One or more JSONL eval files.")
-    ap.add_argument("--max_rows", type=int, default=200, help="Max rows to evaluate total (across files).")
-    ap.add_argument("--seq_len", type=int, default=2048, help="Prompt truncation length.")
-    ap.add_argument("--max_new_tokens", type=int, default=256, help="Generation length.")
-    ap.add_argument("--do_sample", type=str, default="False", help="Stochastic decoding.")
+    ap.add_argument("--base_id_or_path", required=True, help="HF model id or local path")
+    ap.add_argument("--lora_dir", default=None, help="Optional LoRA adapter dir to merge before eval")
+
+    ap.add_argument("--eval_files", required=True, nargs="+",
+                    help="One or more JSONL files (each line has 'messages': [{role, content}, ...])")
+    ap.add_argument("--max_rows", type=int, default=200, help="Evaluate on at most this many rows")
+
+    ap.add_argument("--seq_len", type=int, default=2048, help="Tokenizer max length for prompts")
+    ap.add_argument("--max_new_tokens", type=int, default=256, help="Tokens to generate")
+    ap.add_argument("--do_sample", type=str, default="False")
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--bf16", type=str, default=None, help="Force bf16 (default=auto if supported).")
-    ap.add_argument("--fp16", type=str, default=None, help="Force fp16.")
-    # Hugging Face Hub logging
-    ap.add_argument("--hub_repo_id", type=str, required=True, help="Dataset repo to upload results.")
-    ap.add_argument("--run_name", type=str, default="eval-run", help="A friendly name for this run.")
+
+    ap.add_argument("--bf16", type=str, default=None, help="True/False to force bfloat16 (default: auto)")
+    ap.add_argument("--fp16", type=str, default=None, help="True/False to force float16 (default: opposite of bf16)")
+
+    # HF Hub logging
+    ap.add_argument("--hub_repo_id", required=True, help='e.g. "username/llm-kd-evals" (dataset repo recommended)')
+    ap.add_argument("--run_name", default=None, help="Subfolder name; if omitted, use model+timestamp")
+    ap.add_argument("--hf_token", default=None, help="Token override; else uses env or cached login")
+
+    # GPU monitor
+    ap.add_argument("--gpu_poll_sec", type=float, default=1.0, help="NVML polling interval in seconds")
+
     return ap.parse_args()
 
 
+# ---------------------------------------
+# Main
+# ---------------------------------------
 def main():
     args = parse_args()
 
-    # Numerics selection
-    if torch.cuda.is_available():
-        auto_bf16 = torch.cuda.is_bf16_supported()
-        force_bf16 = str2bool(args.bf16)
-        force_fp16 = str2bool(args.fp16)
-
-        if force_bf16 is True:
-            use_bf16 = True
-        elif force_bf16 is False:
-            use_bf16 = False
-        else:
-            use_bf16 = auto_bf16
-
-        if force_fp16 is True:
-            use_fp16 = True
-            use_bf16 = False
-        elif force_fp16 is False:
-            use_fp16 = False
-        else:
-            use_fp16 = not use_bf16
-    else:
-        use_bf16, use_fp16 = False, False
-
-    # Resolve outputs dir (prefer ./outputs/eval)
-    base_out_dir = os.path.join("outputs", "eval")
-    os.makedirs(base_out_dir, exist_ok=True)
-
-    # Load model & tokenizer
-    tokenizer, model = load_model_and_tokenizer(
-        args.base_id_or_path, use_bf16=use_bf16, use_fp16=use_fp16, seq_len=args.seq_len
-    )
-    model.eval()
-
-    # Generation config
+    # Parse booleans
+    bf16 = str2bool(args.bf16)
+    fp16 = str2bool(args.fp16)
     do_sample = str2bool(args.do_sample) or False
-    gen_kwargs = dict(
-        max_new_tokens=int(args.max_new_tokens),
-        do_sample=do_sample,
+
+    # Output locations
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_name = args.run_name or f"{os.path.basename(args.base_id_or_path)}-{timestamp}"
+    out_dir = os.path.join("outputs", "eval", f"{run_name}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    preds_path = os.path.join(out_dir, "predictions_eval.jsonl")
+    metrics_path = os.path.join(out_dir, "metrics_eval.json")
+    gpu_csv = os.path.join(out_dir, "gpu_trace.csv")
+
+    # Start GPU monitor
+    mon = GPUMonitor(gpu_csv, interval_sec=float(args.gpu_poll_sec))
+    mon.start()
+
+    # Time the full evaluation
+    t0 = time.time()
+
+    # Load model/tokenizer (optional LoRA merge)
+    tokenizer, model, dtype = load_model_and_tokenizer(
+        args.base_id_or_path, args.lora_dir, bf16, fp16, args.seq_len
     )
-    # Only pass top_p/temperature if sampling
-    if do_sample:
-        gen_kwargs.update(top_p=float(args.top_p), temperature=float(args.temperature))
 
-    # Ingest eval rows
-    rows = []
-    for path in args.eval_files:
-        rows.extend(read_jsonl(path))
-        if len(rows) >= args.max_rows:
-            rows = rows[: args.max_rows]
+    # Read evaluation rows (capped)
+    rows: List[Dict[str, Any]] = []
+    for fp in args.eval_files:
+        take = max(0, args.max_rows - len(rows))
+        if take == 0:
             break
+        rows.extend(load_jsonl(fp, max_rows=take))
 
-    # Build prompts and refs
     prompts: List[str] = []
     refs: List[str] = []
-    for r in rows:
-        msgs = r.get("messages", [])
-        prompt, ref = build_prompt_and_ref(msgs)
-        # Safety fallback
-        if not prompt:
-            # if no structure, try to treat 'prompt'/'reference' keys if present
-            prompt = r.get("prompt", "")
-            ref = r.get("reference", ref)
-        prompts.append(prompt)
-        refs.append(ref if isinstance(ref, str) else str(ref))
+    for ex in rows:
+        p, r, _ = extract_prompt_and_ref(tokenizer, ex)
+        prompts.append(p)
+        refs.append(r)
 
-    # Run generation
+    # Generate predictions in small batches
+    B = 8
     hyps: List[str] = []
-    t0 = time.time()
-    gpu_before = snapshot_gpu()
-    with torch.no_grad():
-        for i, prompt in enumerate(prompts):
-            enc = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=args.seq_len,
-            )
-            enc = {k: v.to(model.device) for k, v in enc.items()}
-            out = model.generate(**enc, **gen_kwargs)
-            text = tokenizer.decode(out[0], skip_special_tokens=True)
-            # Try to slice out only the assistant continuation by removing the prompt prefix
-            if text.startswith(prompt):
-                text = text[len(prompt) :]
-            hyps.append(text)
-    gpu_after = snapshot_gpu()
-    wall_time_sec = time.time() - t0
+    for i in range(0, len(prompts), B):
+        batch_prompts = prompts[i : i + B]
+        out = generate_batch(
+            tokenizer,
+            model,
+            batch_prompts,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=do_sample,
+            top_p=args.top_p,
+            temperature=args.temperature,
+        )
+        hyps.extend(out)
+
+    # Save predictions JSONL
+    with open(preds_path, "w", encoding="utf-8") as f:
+        for p, r, h in zip(prompts, refs, hyps):
+            f.write(json.dumps({"prompt": p, "ref": r, "hyp": h}, ensure_ascii=False) + "\n")
 
     # Compute metrics
     bleu4 = compute_bleu4(refs, hyps)
-    codebleu_scores = compute_codebleu(refs, hyps, lang="python")
+    codebleu_scores = compute_codebleu_scores(refs, hyps, lang="python")
+    wall_time = time.time() - t0
+
+    # Pack and save metrics
     metrics = {
-        "bleu4": float(bleu4),
-        **codebleu_scores,
-        "num_examples": len(hyps),
-        "wall_time_sec": float(wall_time_sec),
-        "gpu_before": gpu_before,
-        "gpu_after": gpu_after,
-        "dtype": "bf16" if use_bf16 else ("fp16" if use_fp16 else "fp32"),
         "model": args.base_id_or_path,
-        "run_name": args.run_name,
-        "do_sample": do_sample,
-        "max_new_tokens": int(args.max_new_tokens),
-        "seq_len": int(args.seq_len),
+        "rows": len(hyps),
+        "bleu4": round(bleu4, 4),
+        "dtype": "bf16" if dtype == torch.bfloat16 else ("fp16" if dtype == torch.float16 else "fp32"),
+        "wall_time_sec": round(wall_time, 2),
+        **{k: round(v, 4) for k, v in codebleu_scores.items()},
     }
-
-    # Save local artifacts
-    run_stamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    local_dir = os.path.join(base_out_dir, f"{run_stamp}-{re.sub(r'[^A-Za-z0-9._-]+','-', args.run_name)}")
-    os.makedirs(local_dir, exist_ok=True)
-
-    preds_path = os.path.join(local_dir, "predictions_eval.jsonl")
-    with open(preds_path, "w", encoding="utf-8") as f:
-        for p, r, h in zip(prompts, refs, hyps):
-            f.write(json.dumps({"prompt": p, "reference": r, "prediction": h}, ensure_ascii=False) + "\n")
-
-    metrics_path = os.path.join(local_dir, "metrics_eval.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-    # Minimal README for the local run folder
-    with open(os.path.join(local_dir, "README.md"), "w", encoding="utf-8") as f:
-        f.write(
-            f"# Eval run: {args.run_name}\n\n"
-            f"- Model: `{args.base_id_or_path}`\n"
-            f"- Rows: {len(hyps)}\n"
-            f"- BLEU-4: {metrics['bleu4']:.4f}\n"
-            f"- CodeBLEU: {metrics.get('codebleu', float('nan')):.4f}\n"
-            f"- Wall time (s): {metrics['wall_time_sec']:.2f}\n"
-        )
+    # Stop GPU monitor
+    mon.stop()
 
-    print(f"[local] wrote: {metrics_path}")
-    print(f"[local] wrote: {preds_path}")
+    # Push artifacts to the Hub
+    token = ensure_hf_token(args.hf_token)
+    run_dir_in_repo = f"runs/{run_name}"
+    hf_upload_dir(args.hub_repo_id, run_dir_in_repo, out_dir, token)
 
-    # Upload to Hugging Face Hub (Dataset repo)
-    run_dir = hf_make_run_dir(args.hub_repo_id, args.run_name)
-    hub_files = {
-        "predictions_eval.jsonl": preds_path,
-        "metrics_eval.json": metrics_path,
-    }
-    # Also upload a compact metrics.txt for quick viewing in the UI
-    short_metrics = (
-        f"model={args.base_id_or_path}\n"
-        f"rows={len(hyps)}\n"
-        f"bleu4={metrics['bleu4']:.4f}\n"
-        f"codebleu={metrics.get('codebleu', float('nan')):.4f}\n"
-        f"wall_time_sec={metrics['wall_time_sec']:.2f}\n"
-        f"dtype={metrics['dtype']}\n"
-    )
-    short_path = os.path.join(local_dir, "metrics.txt")
-    with open(short_path, "w", encoding="utf-8") as f:
-        f.write(short_metrics)
-    hub_files["metrics.txt"] = short_path
-
-    hf_upload_run(args.hub_repo_id, hub_files, run_dir, repo_type="dataset")
-    print(f"[hub] uploaded to: https://huggingface.co/datasets/{args.hub_repo_id}/tree/main/{run_dir}")
-
-    # Clean up a bit
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Console summary
+    print("\n=== EVAL DONE ===")
+    print("predictions :", preds_path)
+    print("metrics     :", metrics_path)
+    print("gpu trace   :", gpu_csv)
+    print(f"pushed to   : hf://{args.hub_repo_id}/{run_dir_in_repo}/")
+    print(json.dumps(metrics, indent=2))
 
 
 if __name__ == "__main__":
-    # keep warnings quieter
-    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    # Small perf nicety (safe no-op if unsupported)
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     main()
