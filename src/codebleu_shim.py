@@ -1,65 +1,81 @@
 # src/codebleu_shim.py
 """
-CodeBLEU <-> Tree-Sitter compatibility shim.
+Compatibility shim for codebleu==0.7.0 with modern tree-sitter wheels.
 
-Why: PyPI `codebleu` 0.7.0 tries to import per-language wheels (e.g. tree_sitter_python)
-with an older API. Modern setups commonly use `tree_sitter_languages`, which bundles
-grammars & exposes a single `get_language()` API. Mixing them causes the infamous:
-  TypeError: an integer is required
-This shim forces CodeBLEU to use `tree_sitter_languages` and reloads internals
-so the change actually takes effect.
-
-Usage:
-    import src.codebleu_shim  # must happen BEFORE importing `from codebleu import calc_codebleu`
-    from codebleu import calc_codebleu
+- Forces CodeBLEU to use `tree_sitter_languages.get_language(...)`
+- Emulates the old `parser.language = lang` assignment that CodeBLEU expects,
+  on top of the current `Parser.set_language(lang)` API.
 """
 
-from importlib import reload
+from __future__ import annotations
 
-# import codebleu internal utils and tree_sitter_languages
+# 1) Patch how CodeBLEU loads languages
 try:
-    import codebleu.utils as _cu
     from tree_sitter_languages import get_language as _ts_get_language
 except Exception as e:
     raise RuntimeError(
-        "Failed importing codebleu utils or tree_sitter_languages. "
-        "Install with: pip install codebleu==0.7.0 tree_sitter_languages==1.10.2\n"
-        f"Original error: {e}"
-    )
+        "Missing dependency `tree_sitter_languages`. "
+        "Install with: pip install tree_sitter_languages==1.10.2"
+    ) from e
 
-# Map common names CodeBLEU expects -> keys accepted by tree_sitter_languages
-_TS_LANG_MAP = {
-    "python": "python",
-    "java": "java",
-    "javascript": "javascript",
-    "typescript": "typescript",
-    "c": "c",
-    "cpp": "cpp",
-    "go": "go",
-    "ruby": "ruby",
-    "php": "php",
-    "rust": "rust",
-    "csharp": "c_sharp",
-    "scala": "scala",
-    "kotlin": "kotlin",
-}
-
+from codebleu import utils as _utils
 
 def _patched_get_ts_language(lang: str):
-    key = _TS_LANG_MAP.get(str(lang).lower(), str(lang).lower())
+    # normalize common names to tree-sitter keys; extend as you need
+    alias = {
+        "py": "python",
+        "python": "python",
+        "java": "java",
+        "js": "javascript",
+        "javascript": "javascript",
+        "cpp": "cpp",
+        "c++": "cpp",
+        "c": "c",
+        "go": "go",
+        "ruby": "ruby",
+        "rust": "rust",
+        "php": "php",
+        "scala": "scala",
+        "csharp": "c_sharp",
+        "c-sharp": "c_sharp",
+        "c#": "c_sharp",
+        "kotlin": "kotlin",
+        "typescript": "typescript",
+    }
+    key = alias.get(lang.lower(), lang.lower())
     return _ts_get_language(key)
 
+_utils.get_tree_sitter_language = _patched_get_ts_language  # monkey-patch
 
-# Monkey-patch, then reload modules that cached the old function.
-_cu.get_tree_sitter_language = _patched_get_ts_language
 
-import codebleu.codebleu as _cb  # noqa: E402
-reload(_cb)
+# 2) Patch Parser usage in modules that assume old API (parser.language = lang)
+from tree_sitter import Parser as _Parser
+from codebleu import syntax_match as _syntax
+from codebleu import dataflow_match as _dataflow
 
-# Optional quick self-test when run directly.
-if __name__ == "__main__":
-    from codebleu import calc_codebleu
-    refs = ["def add(a, b):\n    return a + b\n"]
-    hyps = ["def add(a,b):\n    return a+b\n"]
-    out = calc_codebleu(refs, hyps, lang="python")
-    print("[shim self-test OK]", {k: round(v, 4) for k, v in out.items()})
+class _ParserCompat:
+    """
+    Lightweight wrapper over tree_sitter.Parser that exposes a .language property
+    setter, mapping it to .set_language() (new API).
+    """
+    def __init__(self):
+        self._p = _Parser()
+
+    # CodeBLEU writes: parser.language = <Language>
+    @property
+    def language(self):
+        # Not used by CodeBLEU, but kept for completeness
+        return getattr(self, "_lang", None)
+
+    @language.setter
+    def language(self, lang):
+        self._p.set_language(lang)
+        self._lang = lang
+
+    # CodeBLEU calls: parser.parse(src_bytes)
+    def parse(self, *args, **kwargs):
+        return self._p.parse(*args, **kwargs)
+
+# swap Parser in the two modules that instantiate it
+_syntax.Parser = _ParserCompat
+_dataflow.Parser = _ParserCompat
