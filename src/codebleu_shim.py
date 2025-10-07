@@ -1,15 +1,36 @@
 # src/codebleu_shim.py
-"""
-Compatibility shim for codebleu==0.7.0 with modern tree-sitter wheels.
-
-- Forces CodeBLEU to use `tree_sitter_languages.get_language(...)`
-- Emulates the old `parser.language = lang` assignment that CodeBLEU expects,
-  on top of the current `Parser.set_language(lang)` API.
-"""
+# Make CodeBLEU (PyPI 0.7.0) work with modern tree-sitter wheels on Py3.11+
+# - Replaces codebleu.utils.get_tree_sitter_language with a version that uses tree_sitter_languages
+# - Adds a .language property to Parser for packages that only expose .set_language()
 
 from __future__ import annotations
 
-# 1) Patch how CodeBLEU loads languages
+# 1) Patch Parser.language <-> set_language
+try:
+    from tree_sitter import Parser
+except Exception as e:
+    raise RuntimeError("tree_sitter is not installed. `pip install tree_sitter`") from e
+
+if not hasattr(Parser, "language"):
+    # Older/newer bindings don’t expose a .language property; emulate it.
+    _Parser_set_language = getattr(Parser, "set_language", None)
+    if _Parser_set_language is None:
+        raise RuntimeError(
+            "Your tree_sitter.Parser has neither `.language` nor `.set_language()`; "
+            "please reinstall tree_sitter."
+        )
+
+    def _get_lang(self):  # type: ignore[override]
+        # Not strictly needed by CodeBLEU, but helps debugging
+        return getattr(self, "_ts_lang", None)
+
+    def _set_lang(self, lang):  # type: ignore[override]
+        _Parser_set_language(self, lang)
+        setattr(self, "_ts_lang", lang)
+
+    Parser.language = property(_get_lang, _set_lang)  # type: ignore[attr-defined]
+
+# 2) Patch CodeBLEU’s language resolver
 try:
     from tree_sitter_languages import get_language as _ts_get_language
 except Exception as e:
@@ -18,64 +39,46 @@ except Exception as e:
         "Install with: pip install tree_sitter_languages==1.10.2"
     ) from e
 
-from codebleu import utils as _utils
+# Import AFTER patching Parser, then monkey-patch CodeBLEU utils
+from codebleu import utils as _cb_utils  # type: ignore
+
+
+_LANG_ALIASES = {
+    "python": ("python", "py"),
+    "java": ("java",),
+    "javascript": ("javascript", "js"),
+    "cpp": ("cpp", "c++"),
+    "c": ("c",),
+    "go": ("go", "golang"),
+    "ruby": ("ruby", "rb"),
+    "php": ("php",),
+    "csharp": ("c_sharp", "csharp", "c#"),
+    "rust": ("rust",),
+    "scala": ("scala",),
+    "swift": ("swift",),
+    "kotlin": ("kotlin",),
+    "typescript": ("typescript", "ts"),
+}
+
+def _normalize_lang(lang: str) -> str:
+    key = (lang or "").strip().lower()
+    for std, aliases in _LANG_ALIASES.items():
+        if key == std or key in aliases:
+            return std
+    return key
 
 def _patched_get_ts_language(lang: str):
-    # normalize common names to tree-sitter keys; extend as you need
-    alias = {
-        "py": "python",
-        "python": "python",
-        "java": "java",
-        "js": "javascript",
-        "javascript": "javascript",
-        "cpp": "cpp",
-        "c++": "cpp",
-        "c": "c",
-        "go": "go",
-        "ruby": "ruby",
-        "rust": "rust",
-        "php": "php",
-        "scala": "scala",
-        "csharp": "c_sharp",
-        "c-sharp": "c_sharp",
-        "c#": "c_sharp",
-        "kotlin": "kotlin",
-        "typescript": "typescript",
-    }
-    key = alias.get(lang.lower(), lang.lower())
-    return _ts_get_language(key)
-
-_utils.get_tree_sitter_language = _patched_get_ts_language  # monkey-patch
-
-
-# 2) Patch Parser usage in modules that assume old API (parser.language = lang)
-from tree_sitter import Parser as _Parser
-from codebleu import syntax_match as _syntax
-from codebleu import dataflow_match as _dataflow
-
-class _ParserCompat:
     """
-    Lightweight wrapper over tree_sitter.Parser that exposes a .language property
-    setter, mapping it to .set_language() (new API).
+    Return a tree-sitter Language object using tree_sitter_languages,
+    compatible with Parser.language = <Language>.
     """
-    def __init__(self):
-        self._p = _Parser()
+    key = _normalize_lang(lang)
+    try:
+        return _ts_get_language(key)
+    except Exception as e:
+        raise RuntimeError(
+            f"tree_sitter_languages.get_language failed for '{lang}' (normalized '{key}')."
+        ) from e
 
-    # CodeBLEU writes: parser.language = <Language>
-    @property
-    def language(self):
-        # Not used by CodeBLEU, but kept for completeness
-        return getattr(self, "_lang", None)
-
-    @language.setter
-    def language(self, lang):
-        self._p.set_language(lang)
-        self._lang = lang
-
-    # CodeBLEU calls: parser.parse(src_bytes)
-    def parse(self, *args, **kwargs):
-        return self._p.parse(*args, **kwargs)
-
-# swap Parser in the two modules that instantiate it
-_syntax.Parser = _ParserCompat
-_dataflow.Parser = _ParserCompat
+# Monkey-patch CodeBLEU’s resolver
+_cb_utils.get_tree_sitter_language = _patched_get_ts_language  # type: ignore[attr-defined]
