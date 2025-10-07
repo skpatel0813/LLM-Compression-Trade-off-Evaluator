@@ -376,7 +376,6 @@ def main():
         dtype=dtype,                     # use dtype unless quantized
         device_map="auto",
         low_cpu_mem_usage=True,
-        offload_state_dict=True,
         max_memory=max_memory,
     )
 
@@ -413,7 +412,6 @@ def main():
         dtype=dtype,
         device_map="auto",
         low_cpu_mem_usage=True,
-        offload_state_dict=True,
         max_memory=max_memory,
     )
 
