@@ -22,7 +22,7 @@
 #     --max_new_tokens 256 \
 #     --bf16 True \
 #     --do_sample False \
-#     --hub_repo_id "skpatel0813/llm-kd-evals" \
+#     --hub_repo_id "username/llm-kd-evals" \
 #     --run_name "baseline-8B-noKD"
 #
 # Minimal deps:
@@ -46,14 +46,21 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-# ---------------------------
-# Import the CodeBLEU shim FIRST (if present). If not, we still try official.
-# ---------------------------
-# We don't crash if the shim isn't there; we just proceed to official/compat logic later.
+# --------------------------------------------------------------------------------------------------
+# Import the CodeBLEU shim FIRST (if present). Works both with `-m src.eval_codebleu_hub` and PYTHONPATH=src.
+# --------------------------------------------------------------------------------------------------
+_SHIM = None
 try:
-    import codebleu_shim  # noqa: F401  (may patch codebleu internals in your repo)
+    from src import codebleu_shim as _SHIM  # when run as a module
 except Exception:
-    pass
+    try:
+        import codebleu_shim as _SHIM       # when PYTHONPATH includes ./src
+    except Exception:
+        _SHIM = None
+
+if _SHIM is not None and getattr(_SHIM, "READY_MSG", None):
+    # Visible confirmation in logs that patching occurred
+    print(_SHIM.READY_MSG, file=sys.stderr)
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -139,26 +146,25 @@ class GPUMonitor:
             f.write("timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W\n")
             while not self._stop.is_set():
                 try:
-                    # one-shot query; avoid shell string quoting issues
-                    out = subprocess.check_output([
-                        "nvidia-smi",
-                        "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw",
-                        "--format=csv,noheader,nounits",
-                    ], text=True)
+                    out = subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        text=True,
+                    )
                     ts = datetime.now().isoformat()
                     for line in out.strip().splitlines():
                         cols = [c.strip() for c in line.split(",")]
-                        if len(cols) != 5:
-                            continue
-                        f.write(f"{ts},{cols[0]},{cols[1]},{cols[2]},{cols[3]},{cols[4]}\n")
+                        if len(cols) == 5:
+                            f.write(f"{ts},{cols[0]},{cols[1]},{cols[2]},{cols[3]},{cols[4]}\n")
                     f.flush()
                 except Exception:
-                    # give up quietly
                     break
                 self._stop.wait(self.interval)
 
     def start(self):
-        # Try NVML, else smi, else no-op
         try:
             import pynvml  # noqa: F401
             target = self._loop_pynvml
