@@ -1,86 +1,74 @@
-"""
-Robust shim for CodeBLEU on Python:
-
-- Always returns a *tree_sitter.Language* object (never a PyCapsule).
-- Patches BOTH:
-    * codebleu.utils.get_tree_sitter_language
-    * codebleu.codebleu.get_tree_sitter_language
-- Does not depend on tree_sitter_languages (since that varied for you).
-
-Test it with:
-  PYTHONPATH="src:$PYTHONPATH" python - <<'PY'
-  import codebleu_shim
-  from codebleu import calc_codebleu
-  refs = ["def add(a, b):\n    return a + b\n"]
-  hyps = ["def add(a,b):\n    return a+b\n"]
-  print(calc_codebleu(refs, hyps, lang="python"))
-  PY
-"""
+# src/codebleu_shim.py
+# Patch CodeBLEU so it uses tree-sitter-python with tree-sitter==0.22.x
+# and so codebleu's "parser.language = ..." line works by delegating to set_language(...).
 
 from __future__ import annotations
 import importlib
+from tree_sitter import Parser
 
-# We need these types available to manufacture a proper Language object
-try:
+# --- Patch Parser.language property to forward to set_language(...) ---
+# CodeBLEU does:
+#   parser.language = <lang>
+# In tree-sitter 0.22.x, official API is parser.set_language(<Language>).
+# Also, tree_sitter_python.language() returns a PyCapsule, not a Language.
+# We accept either and convert capsules to Language via tree_sitterPython.
+
+def _to_language(obj):
+    """
+    Accept either a tree_sitter.Language or a PyCapsule from tree_sitter_python.language().
+    If it's a capsule, use tree_sitter_python to set it directly.
+    """
+    # If it's already a Language, return as-is.
     from tree_sitter import Language
-except Exception as e:
-    raise RuntimeError(f"[codebleu_shim] Failed to import tree_sitter.Language: {e}")
+    if isinstance(obj, Language):
+        return obj, None  # (Language, capsule)
 
-def _get_ts_lang(lang_name: str):
-    """
-    Return a **tree_sitter.Language** object for the requested language.
+    # Otherwise we expect a PyCapsule from tree_sitter_python.language()
+    # We return (None, capsule) to let the setter handle it via tsp.
+    return None, obj
 
-    We only implement Python here because that’s what you’re evaluating.
-    If you later need more languages, add similar logic for their grammar wheels
-    (e.g., tree_sitter_javascript, tree_sitter_cpp, etc.).
-    """
-    key = (lang_name or "").strip().lower()
+@property
+def _get_language_prop(self: Parser):
+    # not used by CodeBLEU; return None to keep behavior minimal
+    return None
 
+@_get_language_prop.setter  # type: ignore[attr-defined]
+def _set_language_prop(self: Parser, val):
+    lang_obj, capsule = _to_language(val)
+    if lang_obj is not None:
+        # Normal: already a Language
+        self.set_language(lang_obj)
+        return
+    # Capsule path: use tree_sitter_python to set the capsule directly.
+    tsp = importlib.import_module("tree_sitter_python")
+    # tree_sitter 0.22.x Parser has a C-API that accepts the capsule via set_language
+    # (works when capsule comes from the same versioned wheels)
+    self.set_language(tsp.language())
+
+# Install the patched property
+try:
+    Parser.language = _get_language_prop  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+# --- Patch codebleu.utils.get_tree_sitter_language to return the python grammar ---
+# CodeBLEU calls this and then assigns to parser.language (which we just hooked).
+try:
+    import codebleu.utils as _u
+except Exception:
+    _u = None
+
+def _patched_get_ts_language(lang: str):
+    key = (lang or "").strip().lower()
     if key in {"py", "python"}:
-        # 1) Prefer the modern API: module exposes a Language instance as `LANGUAGE`
-        try:
-            tsp = importlib.import_module("tree_sitter_python")
-        except Exception as e:
-            raise RuntimeError(
-                "[codebleu_shim] Could not import 'tree_sitter_python'. "
-                "Install it with: pip install tree-sitter-python"
-            ) from e
-
-        lang_obj = getattr(tsp, "LANGUAGE", None)
-        if lang_obj is not None:
-            # Already a proper tree_sitter.Language in current tree_sitter>=0.22
-            return lang_obj
-
-        # 2) Older API: module exposes a PyCapsule via `language()` → we must wrap it
-        if hasattr(tsp, "language"):
-            try:
-                capsule = tsp.language()  # PyCapsule
-                # Convert PyCapsule to a Language object (works for tree_sitter>=0.22)
-                return Language(capsule)
-            except Exception as e:
-                raise RuntimeError(
-                    "[codebleu_shim] Could not convert Python grammar capsule to tree_sitter.Language. "
-                    "This usually means a binary mismatch between 'tree-sitter' and 'tree-sitter-python'. "
-                    "Try reinstalling both in the SAME env, e.g.\n"
-                    "  pip install -U 'tree-sitter==0.22.3' 'tree-sitter-python==0.23.4'\n"
-                ) from e
-
-        # 3) No known symbol found
-        raise RuntimeError(
-            "[codebleu_shim] tree_sitter_python does not expose 'LANGUAGE' or 'language()'. "
-            "Please upgrade: pip install -U tree-sitter-python"
-        )
-
-    # Not implemented languages (extend as needed)
+        tsp = importlib.import_module("tree_sitter_python")
+        return tsp.language()  # PyCapsule; our setter handles it
     raise NotImplementedError(
-        f"[codebleu_shim] Language '{lang_name}' not supported in shim (only 'python' implemented)."
+        f"Only 'python' is implemented in codebleu_shim; requested '{lang}'."
     )
 
-# --- Patch BOTH places CodeBLEU reads the resolver ---
-# (1) codebleu.utils.get_tree_sitter_language
-import codebleu.utils as _cb_utils
-_cb_utils.get_tree_sitter_language = _get_ts_lang
-
-# (2) codebleu.codebleu.get_tree_sitter_language (local binding used by calc_codebleu)
-_cb_code = importlib.import_module("codebleu.codebleu")
-_cb_code.get_tree_sitter_language = _get_ts_lang
+if _u is not None:
+    try:
+        _u.get_tree_sitter_language = _patched_get_ts_language  # type: ignore[attr-defined]
+    except Exception:
+        pass
