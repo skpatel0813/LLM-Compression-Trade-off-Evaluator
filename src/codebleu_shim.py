@@ -1,141 +1,99 @@
-# src/codebleu_shim.py
-# --------------------------------------------------------------------------------------
-# CodeBLEU (codebleu==0.7.0) expects a tree_sitter.Language for Parser.language,
-# but the canonical `tree_sitter_python.language()` returns a PyCapsule in many builds,
-# which leads to: "TypeError: an integer is required" or similar ABI issues.
-#
-# This shim:
-#   1) Uses `tree_sitter_languages` (prebuilt grammars) to obtain a REAL
-#      `tree_sitter.Language` for Python (and later, other languages, if you add them).
-#   2) Patches BOTH:
-#        - codebleu.utils.get_tree_sitter_language
-#        - codebleu.codebleu.get_tree_sitter_language
-#      so that calc_codebleu() uses our safe function.
-#   3) Verifies the patch on import and prints a short status line to stderr.
-#
-# Requirements (install in the SAME env as CodeBLEU):
-#   pip install "tree_sitter==0.20.2" "tree_sitter_languages==1.10.2"
-#   pip install "codebleu==0.7.0"
-#
-# Usage (MUST import shim *before* codebleu):
-#   import codebleu_shim
-#   from codebleu import calc_codebleu
-#   scores = calc_codebleu(refs, hyps, lang="python")
-# --------------------------------------------------------------------------------------
+"""
+codebleu_shim.py
+Make CodeBLEU 0.7.0 work with tree_sitter==0.20.x by:
+
+- Adding a Parser.language property (so `parser.language = lang` works)
+- Returning a real tree_sitter.Language via tree_sitter_languages.get_language(...)
+- Patching codebleu.utils.get_tree_sitter_language and the duplicate in codebleu.codebleu
+"""
 
 from __future__ import annotations
-import sys
-import inspect
 import importlib
-import importlib.util
-from typing import Optional
+import types
 
-# ---- Hard dependency we rely on: tree_sitter_languages gives us Language objects directly.
+# 1) Patch Parser.language for tree_sitter==0.20.x
 try:
-    from tree_sitter_languages import get_language as _ts_get_language  # returns tree_sitter.Language
+    from tree_sitter import Parser, Language as TS_Language  # type: ignore
 except Exception as e:
     raise RuntimeError(
-        "[codebleu_shim] Failed importing `tree_sitter_languages`. Install with:\n"
-        "  pip install tree_sitter_languages==1.10.2\n"
-        "and ensure it's in the SAME environment as codebleu/transformers."
+        "[codebleu_shim] Failed to import tree_sitter. Ensure it's installed in this env."
     ) from e
 
+# Only add the property if it's not already present
+if not hasattr(Parser, "language"):
+    def _get_lang(self):
+        # best-effort mirror; tree_sitter doesn't expose a getter in 0.20.x
+        return getattr(self, "_shim_lang", None)
 
-# ---- our safe replacement: return a real tree_sitter.Language for the requested lang
-def _get_ts_language_safely(lang: Optional[str]):
+    def _set_lang(self, lang):
+        if not isinstance(lang, TS_Language):
+            raise TypeError("language must be assigned a tree_sitter.Language object")
+        # Forward to the real API in 0.20.x
+        self.set_language(lang)
+        # Keep a Python-side reference for the getter
+        self._shim_lang = lang
+
+    # Attach property to the C-extension class; this works in 0.20.x
+    Parser.language = property(_get_lang, _set_lang)  # type: ignore[attr-defined]
+    _patched_parser = True
+else:
+    _patched_parser = False
+
+# 2) Our replacement that returns a real Language for Python via tree_sitter_languages
+def _get_ts_lang_from_tsl(lang: str) -> TS_Language:
+    """
+    Replacement for codebleu.utils.get_tree_sitter_language(lang).
+    Uses tree_sitter_languages to fetch a real tree_sitter.Language.
+    """
     key = (lang or "").strip().lower()
-    if key in {"py", "python"}:
-        return _ts_get_language("python")   # <class 'tree_sitter.Language'>
-    # Extend here as needed (examples):
-    # elif key in {"js", "javascript"}:
-    #     return _ts_get_language("javascript")
-    # elif key in {"java"}:
-    #     return _ts_get_language("java")
-    raise NotImplementedError(
-        f"[codebleu_shim] Only 'python' is supported right now. Got '{lang}'. "
-        f"Add your language to _get_ts_language_safely if needed."
-    )
-
-
-def _patch_module_getter(mod) -> bool:
-    """
-    Replace mod.get_tree_sitter_language with our safe version.
-    Returns True if patched, False otherwise.
-    """
+    if key not in {"py", "python"}:
+        raise NotImplementedError(
+            f"[codebleu_shim] Only 'python' supported. Got '{lang}'. "
+            "Extend this shim if you need more languages."
+        )
     try:
-        setattr(mod, "get_tree_sitter_language", _get_ts_language_safely)
-        return True
-    except Exception:
-        return False
-
-
-def _eager_patch() -> tuple[bool, bool]:
-    """
-    Try to patch both codebleu.utils and codebleu.codebleu immediately (if already imported).
-    Returns (patched_utils, patched_codebleu).
-    """
-    pu = pc = False
+        tsl = importlib.import_module("tree_sitter_languages")
+    except Exception as e:
+        raise RuntimeError(
+            "[codebleu_shim] Failed importing `tree_sitter_languages`. Install:\n"
+            "  pip install tree_sitter_languages==1.10.2"
+        ) from e
     try:
-        import codebleu.utils as cu
-        pu = _patch_module_getter(cu)
-    except Exception:
-        pass
-    try:
-        import codebleu.codebleu as ccb
-        pc = _patch_module_getter(ccb)
-    except Exception:
-        pass
-    return pu, pc
+        lang_obj = tsl.get_language("python")  # returns a tree_sitter.Language
+    except Exception as e:
+        raise RuntimeError("[codebleu_shim] tree_sitter_languages.get_language('python') failed") from e
+    if not isinstance(lang_obj, TS_Language):
+        raise TypeError("[codebleu_shim] Expected tree_sitter.Language from tree_sitter_languages")
+    return lang_obj
 
+# 3) Patch CodeBLEU’s imports/entrypoints
+_patched_utils = False
+_patched_codebleu = False
 
-# ---- Patch already-imported modules (if any)
-_pu, _pc = _eager_patch()
+try:
+    # Patch codebleu.utils.get_tree_sitter_language
+    utils = importlib.import_module("codebleu.utils")
+    setattr(utils, "get_tree_sitter_language", _get_ts_lang_from_tsl)
+    _patched_utils = True
+except Exception:
+    pass
 
-# ---- Also install a meta-path hook to patch future imports of those modules
-class _ShimImporter:
-    """
-    If `codebleu.utils` or `codebleu.codebleu` are imported AFTER this shim,
-    we intercept, let Python import them, then patch their `get_tree_sitter_language`.
-    """
-    TARGETS = {"codebleu.utils", "codebleu.codebleu"}
+try:
+    # Patch the duplicate in codebleu.codebleu
+    codebleu_mod = importlib.import_module("codebleu.codebleu")
+    # Some versions alias the function at module scope
+    if hasattr(codebleu_mod, "get_tree_sitter_language"):
+        setattr(codebleu_mod, "get_tree_sitter_language", _get_ts_lang_from_tsl)
+        _patched_codebleu = True
+    else:
+        # If it's imported via "from .utils import get_tree_sitter_language", our utils-patch is enough.
+        _patched_codebleu = True
+except Exception:
+    pass
 
-    def find_spec(self, fullname, path, target=None):
-        if fullname not in self.TARGETS:
-            return None
-        spec = importlib.util.find_spec(fullname)
-        if not spec or not spec.loader:
-            return spec
-        _orig_exec = spec.loader.exec_module  # type: ignore[attr-defined]
-
-        def _exec_and_patch(module):
-            _orig_exec(module)
-            _patch_module_getter(module)
-
-        spec.loader.exec_module = _exec_and_patch  # type: ignore[attr-defined]
-        return spec
-
-# install the hook once
-if not any(isinstance(h, _ShimImporter) for h in sys.meta_path):
-    sys.meta_path.insert(0, _ShimImporter())
-
-# ---- Print a quick verification message
-def _verify_and_note():
-    msg = "[codebleu_shim] "
-    try:
-        import codebleu.utils as cu
-        import codebleu.codebleu as ccb
-        ok_u = "_get_ts_language_safely" in inspect.getsource(cu.get_tree_sitter_language)
-        ok_c = "_get_ts_language_safely" in inspect.getsource(ccb.get_tree_sitter_language)
-        if ok_u and ok_c:
-            msg += "patched utils & codebleu ✓\n"
-        elif ok_u:
-            msg += "patched utils ✓ (codebleu will be patched on import)\n"
-        elif ok_c:
-            msg += "patched codebleu ✓ (utils will be patched on import)\n"
-        else:
-            msg += "ready to patch on import…\n"
-    except Exception:
-        msg += "ready to patch on import…\n"
-    sys.stderr.write(msg)
-
-_verify_and_note()
+print(
+    "[codebleu_shim] ready — "
+    f"Parser.language patched={_patched_parser}, "
+    f"utils.patched={_patched_utils}, "
+    f"codebleu.patched={_patched_codebleu}"
+)
