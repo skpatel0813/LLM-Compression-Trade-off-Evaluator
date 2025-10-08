@@ -1,94 +1,57 @@
-# src/codebleu_shim.py - Enhanced version for compatibility
+# src/codebleu_shim.py
+"""
+Compat shim so CodeBLEU 0.7.0 runs on tree-sitter 0.20.x without tree_sitter_python.
+- Replaces codebleu.utils.get_tree_sitter_language() with tree_sitter_languages.get_language()
+- Adds a .language property on Parser that proxies to .set_language()
+"""
+
 from __future__ import annotations
-import sys
-import os
+import re
 
+# 1) Use prebuilt grammars from tree_sitter_languages
 try:
-    from tree_sitter import Parser, Language
+    from tree_sitter_languages import get_language as _ts_get_language
 except Exception as e:
-    raise RuntimeError("tree_sitter is not installed. `pip install tree_sitter`") from e
+    raise RuntimeError(
+        "Missing dependency `tree_sitter_languages`. Install with: "
+        "pip install tree_sitter_languages==1.10.2"
+    ) from e
 
-# Patch Parser.language property if needed
-if not hasattr(Parser, "language"):
-    _set_language = getattr(Parser, "set_language", None)
-    if _set_language is None:
-        raise RuntimeError(
-            "Your tree_sitter.Parser has neither `.language` nor `.set_language()`; "
-            "please reinstall tree_sitter."
-        )
+# 2) Monkey-patch CodeBLEU's language getter
+import codebleu.utils as _cb_utils
 
-    def _get_lang(self):
-        return getattr(self, "_ts_lang", None)
+_LANG_ALIASES = {
+    "py": "python",
+    "python3": "python",
+}
 
-    def _set_lang(self, lang):
-        _set_language(self, lang)
-        setattr(self, "_ts_lang", lang)
-
-    Parser.language = property(_get_lang, _set_lang)
+def _norm_lang(name: str) -> str:
+    n = name.strip().lower()
+    n = _LANG_ALIASES.get(n, n)
+    n = re.sub(r"[^a-z0-9_+-]", "", n)
+    return n
 
 def _patched_get_ts_language(lang: str):
-    key = lang.lower().strip()
-    print(f"DEBUG: Loading language for '{key}'", file=sys.stderr)
-    
-    # Approach 1: Try tree_sitter_languages with error handling
+    key = _norm_lang(lang)
     try:
-        from tree_sitter_languages import get_language as _ts_get_language
-        print("DEBUG: Using tree_sitter_languages", file=sys.stderr)
         return _ts_get_language(key)
-    except TypeError as e:
-        # This is the specific error we're seeing - try alternative approach
-        print(f"DEBUG: tree_sitter_languages failed with TypeError: {e}", file=sys.stderr)
-        
-        # Try importing the language directly from the parsers module
-        try:
-            if key == "python":
-                import tree_sitter_languages.parsers.python
-                return tree_sitter_languages.parsers.python.Python
-            elif key == "java":
-                import tree_sitter_languages.parsers.java  
-                return tree_sitter_languages.parsers.java.Java
-            elif key == "javascript":
-                import tree_sitter_languages.parsers.javascript
-                return tree_sitter_languages.parsers.javascript.Javascript
-            elif key == "cpp":
-                import tree_sitter_languages.parsers.cpp
-                return tree_sitter_languages.parsers.cpp.Cpp
-            elif key == "c":
-                import tree_sitter_languages.parsers.c
-                return tree_sitter_languages.parsers.c.C
-        except ImportError as ie:
-            print(f"DEBUG: Direct import failed: {ie}", file=sys.stderr)
-    
     except Exception as e:
-        print(f"DEBUG: tree_sitter_languages failed with: {e}", file=sys.stderr)
-    
-    # Approach 2: Try building from source if we have the repositories
-    try:
-        # Check if we have any local tree-sitter repositories
-        repo_path = f"tree-sitter-{key}"
-        if os.path.exists(repo_path):
-            print(f"DEBUG: Building {key} from local repo", file=sys.stderr)
-            Language.build_library(f'build/{key}-language.so', [repo_path])
-            return Language(f'build/{key}-language.so', key)
-    except Exception as e:
-        print(f"DEBUG: Build from source failed: {e}", file=sys.stderr)
-    
-    # Final fallback: Use a minimal implementation that skips syntax matching
-    print(f"WARNING: Could not load tree-sitter parser for {key}. Syntax matching will be disabled.", file=sys.stderr)
-    
-    # Return a dummy language object that won't crash
-    class DummyLanguage:
-        def __init__(self):
-            self.name = f"dummy_{key}"
-    
-    return DummyLanguage()
+        raise RuntimeError(
+            f"tree_sitter_languages.get_language failed for {lang!r} (normalized {key!r})."
+        ) from e
 
-# Patch the CodeBLEU modules
-import importlib
-_cb_utils = importlib.import_module("codebleu.utils")
-_cb_mod = importlib.import_module("codebleu.codebleu")
+_cb_utils.get_tree_sitter_language = _patched_get_ts_language  # <- patch applied
 
-_cb_utils.get_tree_sitter_language = _patched_get_ts_language
-_cb_mod.get_tree_sitter_language = _patched_get_ts_language
+# 3) Give Parser a .language property that forwards to .set_language(...)
+from tree_sitter import Parser as _Parser
 
-print("CodeBLEU shim loaded successfully", file=sys.stderr)
+def _get_lang(self):  # optional getter, not used by CodeBLEU
+    return getattr(self, "_compat_lang", None)
+
+def _set_lang(self, lang):
+    # tree-sitter 0.20.x has Parser.set_language(Language)
+    self.set_language(lang)
+    self._compat_lang = lang
+
+# Expose property so codebleu can do: parser.language = <Language>
+_Parser.language = property(_get_lang, _set_lang)
