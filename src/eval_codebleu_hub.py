@@ -2,16 +2,11 @@
 # --------------------------------------------------------------------------------------------------
 # Evaluate a (base or LoRA-merged) model on JSONL chat data and push results to Hugging Face Hub.
 #
-# What you get per run (stored under outputs/eval/<run_name>/ and uploaded to the Hub):
+# What you get per run (locally under outputs/eval/<run_name>/ and uploaded to the Hub):
 #   - predictions_eval.jsonl      : each row has {"prompt", "ref", "hyp"}
-#   - metrics_eval.json           : {"model", "rows", "bleu4", "codebleu", "...subscores", "dtype", "wall_time_sec"}
-#   - gpu_trace.csv               : timestamp,gpu,util%,mem_used_MB,mem_total_MB,power_W (sampled each second)
-#
-# Key features:
-#   - Works with Llama-3.x etc. via HF Transformers
-#   - Optional LoRA merge (materialize adapters before eval)
-#   - Robust CodeBLEU via a shim that uses tree_sitter_languages (no fragile per-lang wheels)
-#   - Push artifacts to a Hugging Face *dataset* repo (recommended) with a simple folder layout
+#   - metrics_eval.json           : {"model","rows","bleu4","codebleu", sub-scores, "dtype","wall_time_sec"}
+#   - gpu_trace.csv               : timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W (1 Hz)
+#   - README.md                   : nice summary of metrics for the Hub UI
 #
 # Usage example:
 #   export HUGGINGFACE_HUB_TOKEN=hf_xxx
@@ -25,7 +20,7 @@
 #     --hub_repo_id "username/llm-kd-evals" \
 #     --run_name "baseline-8B-noKD"
 #
-# Requirements in your env:
+# Requirements:
 #   pip install -U transformers sacrebleu codebleu tree_sitter_languages huggingface_hub pynvml peft
 # --------------------------------------------------------------------------------------------------
 
@@ -35,34 +30,121 @@ import json
 import os
 import sys
 import time
+import threading
+import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# IMPORTANT: Make CodeBLEU work with tree_sitter_languages before importing calc_codebleu
-# This file must exist at src/codebleu_shim.py (provided separately)
-import src.codebleu_shim  # noqa: F401  (monkey-patches codebleu internals)
-from codebleu import calc_codebleu
+# --- CodeBLEU shim (must come BEFORE importing codebleu.calc_codebleu) -----------------------------
+try:
+    import src.codebleu_shim  # noqa: F401  (monkey-patches codebleu internals to use tree_sitter_languages)
+except Exception as e:
+    print(f"[WARN] codebleu_shim import failed: {e}\n"
+          f"       CodeBLEU will try to run without the shim.", file=sys.stderr)
+
+# CodeBLEU + BLEU
+try:
+    from codebleu import calc_codebleu as _codebleu_fn
+    _HAS_CODEBLEU = True
+except Exception as e:
+    print(f"[WARN] CodeBLEU import failed: {e}\n"
+          f"       CodeBLEU metrics will be set to NaN.", file=sys.stderr)
+    _HAS_CODEBLEU = False
+
 import sacrebleu
 
+# HF Hub
 from huggingface_hub import HfApi, HfFolder, create_repo, upload_file
 
-# Optional LoRA support (merge adapters into base weights)
+# LoRA (optional)
 try:
     from peft import PeftModel
     _HAS_PEFT = True
 except Exception:
     _HAS_PEFT = False
 
-# Lightweight NVML sampler (provided separately at src/gpu_monitor.py)
-from src.gpu_monitor import GPUMonitor
+
+# === Lightweight GPU monitor (pynvml if available, else nvidia-smi subprocess) ====================
+class GPUMonitor:
+    def __init__(self, csv_path: str, interval_sec: float = 1.0):
+        self.csv_path = csv_path
+        self.interval = float(interval_sec)
+        self._stop = threading.Event()
+        self._th = None
+        self._use_nvml = False
+        try:
+            import pynvml  # noqa
+            self._use_nvml = True
+        except Exception:
+            self._use_nvml = False
+
+    def start(self):
+        os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+        with open(self.csv_path, "w", encoding="utf-8") as f:
+            f.write("timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W\n")
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._th:
+            self._th.join(timeout=5)
+
+    def _loop(self):
+        if self._use_nvml:
+            self._loop_nvml()
+        else:
+            self._loop_nvidia_smi()
+
+    def _loop_nvml(self):
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            n = pynvml.nvmlDeviceGetCount()
+            while not self._stop.is_set():
+                ts = datetime.utcnow().isoformat()
+                lines = []
+                for i in range(n):
+                    h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                    power = 0.0
+                    try:
+                        power = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+                    except Exception:
+                        power = 0.0
+                    lines.append(f"{ts},{i},{util},{mem.used//(1024*1024)},{mem.total//(1024*1024)},{power}\n")
+                with open(self.csv_path, "a", encoding="utf-8") as f:
+                    f.writelines(lines)
+                time.sleep(self.interval)
+        except Exception as e:
+            print(f"[WARN] NVML monitor failed, falling back to nvidia-smi: {e}", file=sys.stderr)
+            self._loop_nvidia_smi()
+
+    def _loop_nvidia_smi(self):
+        q = ["index,utilization.gpu,memory.used,memory.total,power.draw"]
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu="+q[0], "--format=csv,noheader,nounits"],
+                    stderr=subprocess.DEVNULL,
+                ).decode("utf-8").strip().splitlines()
+                ts = datetime.utcnow().isoformat()
+                with open(self.csv_path, "a", encoding="utf-8") as f:
+                    for row in out:
+                        parts = [p.strip() for p in row.split(",")]
+                        if len(parts) != 5:
+                            continue
+                        f.write(f"{ts},{parts[0]},{parts[1]},{parts[2]},{parts[3]},{parts[4]}\n")
+            except Exception:
+                pass
+            time.sleep(self.interval)
 
 
-# ---------------------------------------
-# Small helpers
-# ---------------------------------------
+# === Helpers ======================================================================================
 def str2bool(x: Optional[str]) -> Optional[bool]:
     if x is None:
         return None
@@ -72,7 +154,7 @@ def str2bool(x: Optional[str]) -> Optional[bool]:
 def load_jsonl(fp: str, max_rows: int) -> List[Dict[str, Any]]:
     rows = []
     with open(fp, "r", encoding="utf-8") as f:
-        for _line_idx, line in enumerate(f):
+        for line in f:
             if not line.strip():
                 continue
             try:
@@ -86,21 +168,19 @@ def load_jsonl(fp: str, max_rows: int) -> List[Dict[str, Any]]:
 
 def extract_prompt_and_ref(tokenizer, ex: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, str]]]:
     """
-    Expect JSONL lines of the shape:
+    Expects:
       {"messages": [{"role": "user"/"assistant"/"system", "content": "..."} , ...]}
-
-    We use tokenizer.apply_chat_template(messages, add_generation_prompt=True) to build the prompt.
-    The reference 'ref' is considered the last assistant message (if present).
+    Reference is the last assistant message (if present); the prompt is built from the rest.
     """
     msgs: List[Dict[str, str]] = ex.get("messages", [])
     if not msgs:
-        # Fallback: accept single-field examples
+        # fallback single-field records
         user = ex.get("user", "") or ex.get("prompt", "")
         msgs = [{"role": "user", "content": user}]
 
     ref = ""
-    if msgs and msgs[-1]["role"] == "assistant":
-        ref = msgs[-1]["content"]
+    if msgs and msgs[-1].get("role") == "assistant":
+        ref = msgs[-1].get("content", "")
         msgs_for_prompt = msgs[:-1]
     else:
         msgs_for_prompt = msgs
@@ -114,10 +194,6 @@ def extract_prompt_and_ref(tokenizer, ex: Dict[str, Any]) -> Tuple[str, str, Lis
 
 
 def maybe_merge_lora(model, lora_dir: Optional[str]) -> Any:
-    """
-    If a LoRA adapter dir is specified, load and try to merge it into the base model.
-    If merge is unsupported, we still return a PEFT-wrapped model and proceed.
-    """
     if not lora_dir:
         return model
     if not _HAS_PEFT:
@@ -126,7 +202,6 @@ def maybe_merge_lora(model, lora_dir: Optional[str]) -> Any:
     try:
         model = model.merge_and_unload()
     except Exception:
-        # Keep as PEFT wrapper if not mergeable
         pass
     return model
 
@@ -140,7 +215,7 @@ def load_model_and_tokenizer(
 ) -> Tuple[Any, Any, torch.dtype]:
     """
     Load tokenizer + model with auto device_map and selected dtype (bf16/fp16/fp32).
-    Optionally merge LoRA adapters into the base model.
+    Sets left-padding (decoder-only) and merges LoRA if provided.
     """
     if torch.cuda.is_available():
         auto_bf16 = torch.cuda.is_bf16_supported()
@@ -154,6 +229,7 @@ def load_model_and_tokenizer(
     tok = AutoTokenizer.from_pretrained(base_id_or_path, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    tok.padding_side = "left"          # << important for decoder-only generation
     tok.model_max_length = seq_len
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -181,16 +257,18 @@ def generate_batch(
     )
     enc = {k: v.to(model.device) for k, v in enc.items()}
 
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    if do_sample:
+        gen_kwargs.update(dict(do_sample=True, top_p=top_p, temperature=temperature))
+    else:
+        gen_kwargs.update(dict(do_sample=False))
+
     with torch.no_grad():
-        out = model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            top_p=top_p,
-            temperature=temperature,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        out = model.generate(**enc, **gen_kwargs)
 
     decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
     results: List[str] = []
@@ -203,31 +281,38 @@ def generate_batch(
 
 
 def compute_bleu4(refs: List[str], hyps: List[str]) -> float:
-    """
-    BLEU-4 via SacreBLEU. (one reference per hypothesis)
-    """
     bleu = sacrebleu.corpus_bleu(hyps, [refs], force=True, tokenize="intl")
     return float(bleu.score)
 
 
 def compute_codebleu_scores(refs: List[str], hyps: List[str], lang: str = "python") -> Dict[str, float]:
-    """
-    CodeBLEU (overall + sub-scores) using patched codebleu (see codebleu_shim.py).
-    Returns dict with keys:
-      - codebleu
-      - codebleu_ngram
-      - codebleu_weighted_ngram
-      - codebleu_syntax
-      - codebleu_dataflow
-    """
-    out = calc_codebleu(refs, hyps, lang=lang)
-    return {
-        "codebleu": float(out["codebleu"]),
-        "codebleu_ngram": float(out["ngram_match"]),
-        "codebleu_weighted_ngram": float(out["weighted_ngram_match"]),
-        "codebleu_syntax": float(out["syntax_match"]),
-        "codebleu_dataflow": float(out["dataflow_match"]),
-    }
+    if not _HAS_CODEBLEU:
+        return {
+            "codebleu": float("nan"),
+            "codebleu_ngram": float("nan"),
+            "codebleu_weighted_ngram": float("nan"),
+            "codebleu_syntax": float("nan"),
+            "codebleu_dataflow": float("nan"),
+        }
+    try:
+        out = _codebleu_fn(refs, hyps, lang=lang)
+        # PyPI codebleu returns keys: codebleu, ngram_match, weighted_ngram_match, syntax_match, dataflow_match
+        return {
+            "codebleu": float(out["codebleu"]),
+            "codebleu_ngram": float(out["ngram_match"]),
+            "codebleu_weighted_ngram": float(out["weighted_ngram_match"]),
+            "codebleu_syntax": float(out["syntax_match"]),
+            "codebleu_dataflow": float(out["dataflow_match"]),
+        }
+    except Exception as e:
+        print(f"[WARN] CodeBLEU computation failed: {e}", file=sys.stderr)
+        return {
+            "codebleu": float("nan"),
+            "codebleu_ngram": float("nan"),
+            "codebleu_weighted_ngram": float("nan"),
+            "codebleu_syntax": float("nan"),
+            "codebleu_dataflow": float("nan"),
+        }
 
 
 def ensure_hf_token(token: Optional[str]) -> str:
@@ -240,13 +325,12 @@ def ensure_hf_token(token: Optional[str]) -> str:
 def hf_upload_dir(repo_id: str, run_dir: str, local_dir: str, token: str):
     """
     Upload all files under `local_dir` into the dataset repo `repo_id` at path `run_dir/..`.
-    If the dataset repo does not exist, create it (if it's actually a model repo, uploads still proceed).
+    If the dataset repo does not exist, create it (if it's a model repo, uploads still proceed).
     """
     api = HfApi()
     try:
         create_repo(repo_id, token=token, repo_type="dataset", exist_ok=True)
     except Exception:
-        # Repo might already exist as a model repo, still fine to upload
         pass
 
     for root, _, files in os.walk(local_dir):
@@ -262,9 +346,25 @@ def hf_upload_dir(repo_id: str, run_dir: str, local_dir: str, token: str):
             )
 
 
-# ---------------------------------------
-# CLI
-# ---------------------------------------
+def write_readme(path: str, metrics: Dict[str, Any], run_name: str):
+    lines = [
+        f"# {run_name}",
+        "",
+        "## Metrics",
+        "",
+        "| metric | value |",
+        "|---|---:|",
+    ]
+    for k in ["bleu4", "codebleu", "codebleu_ngram", "codebleu_weighted_ngram",
+              "codebleu_syntax", "codebleu_dataflow", "rows", "dtype", "wall_time_sec"]:
+        if k in metrics:
+            lines.append(f"| {k} | {metrics[k]} |")
+    lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# === CLI ==========================================================================================
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base_id_or_path", required=True, help="HF model id or local path")
@@ -289,15 +389,19 @@ def parse_args():
     ap.add_argument("--hf_token", default=None, help="Token override; else uses env or cached login")
 
     # GPU monitor
-    ap.add_argument("--gpu_poll_sec", type=float, default=1.0, help="NVML polling interval in seconds")
+    ap.add_argument("--gpu_poll_sec", type=float, default=1.0, help="NVML/nvidia-smi polling interval in seconds")
 
     return ap.parse_args()
 
 
-# ---------------------------------------
-# Main
-# ---------------------------------------
+# === Main =========================================================================================
 def main():
+    # small perf nicety
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     args = parse_args()
 
     # Parse booleans
@@ -314,6 +418,7 @@ def main():
     preds_path = os.path.join(out_dir, "predictions_eval.jsonl")
     metrics_path = os.path.join(out_dir, "metrics_eval.json")
     gpu_csv = os.path.join(out_dir, "gpu_trace.csv")
+    readme_path = os.path.join(out_dir, "README.md")
 
     # Start GPU monitor
     mon = GPUMonitor(gpu_csv, interval_sec=float(args.gpu_poll_sec))
@@ -343,7 +448,7 @@ def main():
         refs.append(r)
 
     # Generate predictions in small batches
-    B = 8
+    B = int(os.environ.get("EVAL_BATCH_SIZE", "8"))
     hyps: List[str] = []
     for i in range(0, len(prompts), B):
         batch_prompts = prompts[i : i + B]
@@ -371,17 +476,21 @@ def main():
     # Pack and save metrics
     metrics = {
         "model": args.base_id_or_path,
+        "lora_dir": args.lora_dir or "",
         "rows": len(hyps),
         "bleu4": round(bleu4, 4),
         "dtype": "bf16" if dtype == torch.bfloat16 else ("fp16" if dtype == torch.float16 else "fp32"),
         "wall_time_sec": round(wall_time, 2),
-        **{k: round(v, 4) for k, v in codebleu_scores.items()},
+        **{k: (None if isinstance(v, float) and (v != v) else round(v, 4)) for k, v in codebleu_scores.items()},
     }
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
     # Stop GPU monitor
     mon.stop()
+
+    # README for the Hub
+    write_readme(readme_path, metrics, run_name)
 
     # Push artifacts to the Hub
     token = ensure_hf_token(args.hf_token)
@@ -398,9 +507,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Small perf nicety (safe no-op if unsupported)
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
     main()
