@@ -1,59 +1,67 @@
 # src/codebleu_shim.py
 """
-Compat shim so CodeBLEU 0.7.0 works without tree_sitter_python by using
-tree_sitter_languages and a Parser.language property.
+Compatibility shim for CodeBLEU 0.7.0 with modern tree-sitter / tree-sitter-python.
 
-Patches BOTH:
-  - codebleu.utils.get_tree_sitter_language
-  - codebleu.codebleu.get_tree_sitter_language
+What it does:
+  1) Patches codebleu.utils.get_tree_sitter_language(lang) to return the right
+     grammar object directly (e.g., tree_sitter_python.language()) instead of wrapping
+     with tree_sitter.Language(...), which causes a TypeError with newer wheels.
+  2) Adds a property `Parser.language` that proxies assignment to `Parser.set_language(...)`
+     so CodeBLEU's `parser.language = ...` code continues to work.
+
+Requirements:
+  - codebleu==0.7.0
+  - tree-sitter==0.22.3
+  - tree-sitter-python==0.23.4
 """
 
 from __future__ import annotations
-import re
+import importlib
+import sys
 
-# 1) get Language objects from tree_sitter_languages
+# 1) Patch Parser.language property to use set_language
 try:
-    from tree_sitter_languages import get_language as _ts_get_language
+    from tree_sitter import Parser
 except Exception as e:
-    raise RuntimeError(
-        "Missing dependency `tree_sitter_languages`. Install with:\n"
-        "  pip install tree_sitter_languages==1.10.2"
-    ) from e
+    raise RuntimeError(f"Failed to import tree_sitter.Parser: {e}")
 
-_LANG_ALIASES = {
-    "py": "python",
-    "python3": "python",
-}
+if not hasattr(Parser, "language"):
+    # define a property that stores/returns the last set language
+    def _get_lang(self):
+        return getattr(self, "_shim_lang", None)
 
-def _norm_lang(name: str) -> str:
-    n = name.strip().lower()
-    n = _LANG_ALIASES.get(n, n)
-    n = re.sub(r"[^a-z0-9_+-]", "", n)
-    return n
+    def _set_lang(self, lang):
+        # Newer API wants the grammar object directly
+        self.set_language(lang)
+        self._shim_lang = lang
 
-def _patched_get_ts_language(lang: str):
-    key = _norm_lang(lang)
-    try:
-        return _ts_get_language(key)
-    except Exception as e:
-        raise RuntimeError(
-            f"tree_sitter_languages.get_language failed for {lang!r} (normalized {key!r})."
-        ) from e
+    Parser.language = property(_get_lang, _set_lang)  # type: ignore[attr-defined]
 
-# 2) Apply patches to BOTH modules
-import codebleu.utils as _cb_utils
-_cb_utils.get_tree_sitter_language = _patched_get_ts_language
+# 2) Patch CodeBLEU's get_tree_sitter_language
+try:
+    import codebleu.utils as cb_utils
+except Exception as e:
+    raise RuntimeError(f"Failed to import codebleu.utils: {e}")
 
-import codebleu.codebleu as _cb_main
-_cb_main.get_tree_sitter_language = _patched_get_ts_language
+def _get_ts_lang(lang_name: str):
+    """
+    Return the correct grammar object for the requested language.
+    CodeBLEU calls this and then does: parser.language = <returned value>
+    which our property redirects to parser.set_language(...).
+    """
+    key = (lang_name or "").strip().lower()
+    if key in {"py", "python"}:
+        tsp = importlib.import_module("tree_sitter_python")
+        return tsp.language()
 
-# 3) Provide Parser.language write-only property that forwards to set_language
-from tree_sitter import Parser as _Parser
+    # You can extend this block with other grammars:
+    #   - Java:     pip install tree_sitter_javascript / tree_sitter_java (if available)
+    #   - C/C++:    pip install tree_sitter_c / tree_sitter_cpp
+    # For now, raise a clear error for unsupported languages.
+    raise NotImplementedError(
+        f"CodeBLEU shim: language '{lang_name}' not supported. "
+        f"Currently implemented: python"
+    )
 
-def _set_lang(self, lang):
-    # CodeBLEU does: parser.language = <Language>
-    # For tree_sitter>=0.20, the supported API is set_language(lang)
-    self.set_language(lang)
-
-# only a setter; getter not needed
-_Parser.language = property(fset=_set_lang)
+# Monkey-patch
+cb_utils.get_tree_sitter_language = _get_ts_lang
