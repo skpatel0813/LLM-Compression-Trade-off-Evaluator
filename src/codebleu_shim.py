@@ -5,7 +5,7 @@ tree_sitter_languages and a Parser.language property.
 
 Patches BOTH:
   - codebleu.utils.get_tree_sitter_language
-  - codebleu.codebleu.get_tree_sitter_language  (because it's imported via 'from .utils import ...')
+  - codebleu.codebleu.get_tree_sitter_language
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ except Exception as e:
         "  pip install tree_sitter_languages==1.10.2"
     ) from e
 
-# Normalize language names a bit
 _LANG_ALIASES = {
     "py": "python",
     "python3": "python",
@@ -48,14 +47,13 @@ _cb_utils.get_tree_sitter_language = _patched_get_ts_language
 import codebleu.codebleu as _cb_main
 _cb_main.get_tree_sitter_language = _patched_get_ts_language
 
-# 3) Give Parser a .language property that forwards to set_language (CodeBLEU expects assignment)
+# 3) Provide Parser.language write-only property that forwards to set_language
 from tree_sitter import Parser as _Parser
 
-def _get_lang(self):  # optional getter, rarely used
-    return getattr(self, "_compat_lang", None)
-
 def _set_lang(self, lang):
+    # CodeBLEU does: parser.language = <Language>
+    # For tree_sitter>=0.20, the supported API is set_language(lang)
     self.set_language(lang)
-    self._compat_lang = lang
 
-_Parser.language = property(_get_lang, _set_lang)
+# only a setter; getter not needed
+_Parser.language = property(fset=_set_lang)
