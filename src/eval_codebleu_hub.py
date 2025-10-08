@@ -5,18 +5,14 @@
 # Artifacts per run (saved under outputs/eval/<run_name>/ and uploaded to the Hub):
 #   - predictions_eval.jsonl : each line {"prompt", "ref", "hyp"}
 #   - metrics_eval.json      : {"model","rows","bleu4","codebleu", sub-scores, "dtype","wall_time_sec"}
-#   - gpu_trace.csv          : timestamp,gpu,util%,mem_used_MiB,mem_total_MiB,power_W (sampled each second)
+#   - gpu_trace.csv          : timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W
 #
-# Features:
-#   - Robust loader for decoder-only LLMs (e.g., Llama 3.x) with dtype auto-selection
-#   - Optional LoRA merge (PEFT) before eval
-#   - Left-padding for decoder-only generation (prevents HF warnings & subtle issues)
-#   - CodeBLEU:
-#       * First tries official `codebleu` (if correctly installed)
-#       * Otherwise falls back to `src.codebleu_compat` (no external CodeXGLUE)
-#   - Push to a Hugging Face *dataset* repo under `runs/<run_name>/...`
+# Notes:
+#   - We try official `codebleu` first; if it errors, we fall back to `src.codebleu_compat`.
+#   - For decoder-only models (e.g., Llama 3.x), we set padding_side='left' to avoid subtle issues.
+#   - GPU monitoring is done in a Python thread; no shell one-liners that can break quoting.
 #
-# Usage:
+# Quick usage:
 #   export HUGGINGFACE_HUB_TOKEN=hf_xxx
 #   CUDA_VISIBLE_DEVICES=0 "$CONDA_PREFIX/bin/python" -u -m src.eval_codebleu_hub \
 #     --base_id_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -30,13 +26,12 @@
 #     --run_name "baseline-8B-noKD"
 #
 # Minimal deps:
-#   pip install -U transformers sacrebleu huggingface_hub pynvml  # (pynvml only for nicer GPU csv)
-#   # For fallback CodeBLEU (no CodeXGLUE):
-#   pip install -U tree-sitter tree-sitter-python
-#
-# Notes:
-#   - If official `codebleu` is installed and compatible, it will be used.
-#   - If not, fallback module `src/codebleu_compat.py` (provided separately) is used automatically.
+#   pip install -U transformers sacrebleu huggingface_hub
+#   # Optional (makes GPU trace richer):
+#   pip install -U pynvml
+#   # If you want official CodeBLEU:
+#   pip install -U codebleu
+#   # If official CodeBLEU fails, this script auto-falls back to src/codebleu_compat.py
 # --------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -46,8 +41,19 @@ import math
 import os
 import sys
 import time
+import threading
+import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------
+# Import the CodeBLEU shim FIRST (if present). If not, we still try official.
+# ---------------------------
+# We don't crash if the shim isn't there; we just proceed to official/compat logic later.
+try:
+    import codebleu_shim  # noqa: F401  (may patch codebleu internals in your repo)
+except Exception:
+    pass
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -65,58 +71,106 @@ except Exception:
     _HAS_PEFT = False
 
 # ---------------------------
-# CodeBLEU: try official first
+# CodeBLEU options (official first, then fallback)
 # ---------------------------
 _USE_OFFICIAL_CODEBLEU = True
+_official_calc_codebleu = None
 try:
-    from codebleu import calc_codebleu as _official_calc_codebleu
+    from codebleu import calc_codebleu as _official_calc_codebleu  # type: ignore
 except Exception:
     _USE_OFFICIAL_CODEBLEU = False
 
-# Fallback (dependency-light) CodeBLEU (you must have src/codebleu_compat.py in your repo)
+_compat_calc_codebleu = None
 try:
-    from src.codebleu_compat import calc_codebleu as _compat_calc_codebleu  # noqa: F401
+    from src.codebleu_compat import calc_codebleu as _compat_calc_codebleu  # type: ignore
 except Exception:
-    _compat_calc_codebleu = None  # type: ignore
+    _compat_calc_codebleu = None
 
 
 # ---------------------------
-# Simple GPU monitor (nvidia-smi)
+# Safe GPU monitor (Python thread)
 # ---------------------------
 class GPUMonitor:
     """
-    Samples GPU utilization/memory/power via nvidia-smi every `interval` seconds
-    and writes to a CSV. If nvidia-smi is unavailable, it quietly does nothing.
+    Samples GPU utilization/memory/power into a CSV.
+    - Prefers pynvml (fine-grained and cheap)
+    - Falls back to 'nvidia-smi' if pynvml isn't available
+    If neither works, it silently does nothing.
     """
-    def __init__(self, out_csv: str, interval: float = 1.0):
+    def __init__(self, out_csv: str, interval_sec: float = 1.0):
         self.out_csv = out_csv
-        self.interval = interval
-        self._proc = None
+        self.interval = float(interval_sec)
+        self._stop = threading.Event()
+        self._thr: Optional[threading.Thread] = None
+        os.makedirs(os.path.dirname(self.out_csv), exist_ok=True)
+
+    def _loop_pynvml(self):
+        import datetime as _dt
+        import pynvml as _nv
+        with open(self.out_csv, "w", encoding="utf-8") as f:
+            f.write("timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W\n")
+            try:
+                _nv.nvmlInit()
+                n = _nv.nvmlDeviceGetCount()
+                while not self._stop.is_set():
+                    ts = _dt.datetime.now().isoformat()
+                    for i in range(n):
+                        h = _nv.nvmlDeviceGetHandleByIndex(i)
+                        util = _nv.nvmlDeviceGetUtilizationRates(h)
+                        mem = _nv.nvmlDeviceGetMemoryInfo(h)
+                        try:
+                            pwr = _nv.nvmlDeviceGetPowerUsage(h) / 1000.0
+                        except Exception:
+                            pwr = float("nan")
+                        f.write(f"{ts},{i},{util.gpu},{mem.used/1048576:.0f},{mem.total/1048576:.0f},{pwr:.1f}\n")
+                    f.flush()
+                    self._stop.wait(self.interval)
+            except Exception:
+                # fallback to smi if pynvml fails midway
+                pass
+            finally:
+                try:
+                    _nv.nvmlShutdown()
+                except Exception:
+                    pass
+
+    def _loop_smi(self):
+        with open(self.out_csv, "w", encoding="utf-8") as f:
+            f.write("timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W\n")
+            while not self._stop.is_set():
+                try:
+                    # one-shot query; avoid shell string quoting issues
+                    out = subprocess.check_output([
+                        "nvidia-smi",
+                        "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw",
+                        "--format=csv,noheader,nounits",
+                    ], text=True)
+                    ts = datetime.now().isoformat()
+                    for line in out.strip().splitlines():
+                        cols = [c.strip() for c in line.split(",")]
+                        if len(cols) != 5:
+                            continue
+                        f.write(f"{ts},{cols[0]},{cols[1]},{cols[2]},{cols[3]},{cols[4]}\n")
+                    f.flush()
+                except Exception:
+                    # give up quietly
+                    break
+                self._stop.wait(self.interval)
 
     def start(self):
+        # Try NVML, else smi, else no-op
         try:
-            import subprocess
-            os.makedirs(os.path.dirname(self.out_csv), exist_ok=True)
-            with open(self.out_csv, "w", encoding="utf-8") as f:
-                f.write("timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W\n")
-            cmd = (
-                "bash -lc 'while :; do "
-                "d=$(date -Is); "
-                "nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw "
-                "--format=csv,noheader,nounits | "
-                "awk -v d=\"$d\" -F, '{printf \"%s,%s,%s,%s,%s,%s\\n\",d,$1,$2,$3,$4,$5}'; "
-                f"sleep {self.interval}; done'"
-            )
-            self._proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash")
+            import pynvml  # noqa: F401
+            target = self._loop_pynvml
         except Exception:
-            self._proc = None  # degrade quietly
+            target = self._loop_smi
+        self._thr = threading.Thread(target=target, daemon=True)
+        self._thr.start()
 
     def stop(self):
-        if self._proc is not None:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
+        self._stop.set()
+        if self._thr is not None:
+            self._thr.join(timeout=2.0)
 
 
 # ---------------------------
@@ -270,7 +324,7 @@ def compute_codebleu(refs: List[str], hyps: List[str]) -> Dict[str, Optional[flo
       codebleu, codebleu_ngram, codebleu_weighted_ngram, codebleu_syntax, codebleu_dataflow
     """
     # Try official package first
-    if _USE_OFFICIAL_CODEBLEU:
+    if _USE_OFFICIAL_CODEBLEU and _official_calc_codebleu is not None:
         try:
             out = _official_calc_codebleu(refs, hyps, lang="python")
             return {
@@ -363,7 +417,7 @@ def parse_args():
     ap.add_argument("--hf_token", default=None, help="Token override; else env/cached login")
 
     # GPU monitor
-    ap.add_argument("--gpu_poll_sec", type=float, default=1.0, help="nvidia-smi polling interval seconds")
+    ap.add_argument("--gpu_poll_sec", type=float, default=1.0, help="GPU polling interval seconds")
 
     return ap.parse_args()
 
@@ -390,7 +444,7 @@ def main():
     gpu_csv = os.path.join(out_dir, "gpu_trace.csv")
 
     # Start GPU monitor
-    mon = GPUMonitor(gpu_csv, interval=args.gpu_poll_sec)
+    mon = GPUMonitor(gpu_csv, interval_sec=args.gpu_poll_sec)
     mon.start()
 
     t0 = time.time()
