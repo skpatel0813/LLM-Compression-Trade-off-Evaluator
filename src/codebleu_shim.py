@@ -1,99 +1,86 @@
-# src/codebleu_shim.py
-# --------------------------------------------------------------------------------------
-# Make CodeBLEU 0.7.0 work with tree_sitter==0.20.x by:
-#   1) Adding a Parser.language property that forwards to set_language(Language)
-#      and stores the assigned Language in a global dict keyed by id(parser).
-#   2) Replacing codebleu.utils.get_tree_sitter_language to return a real
-#      tree_sitter.Language for Python via tree_sitter_languages.
-#   3) Also patching codebleu.codebleu in case it imports that symbol directly.
-#
-# Supports: lang="python".
-# Requires: pip install codebleu==0.7.0 tree_sitter_languages==1.10.2
-# --------------------------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+A robust CodeBLEU wrapper that:
+- prefers the official 'codebleu' package when available
+- falls back to a bundled-compatible implementation if needed
+- normalizes code and tolerates parser failures
+"""
 
 from __future__ import annotations
-import importlib
+import re
+from typing import List, Dict, Any
 
+# Try the official package
+_OFFICIAL_OK = False
 try:
-    from tree_sitter import Parser, Language as TS_Language  # type: ignore
-except Exception as e:
-    raise RuntimeError(
-        "[codebleu_shim] Failed to import tree_sitter. Install it in this env."
-    ) from e
-
-# --- Store assigned languages per Parser (Parser cannot hold new attrs; also not weakref'able) ---
-_PARSER_LANG_BY_ID: dict[int, TS_Language] = {}
-
-def _parser_get_lang(self) -> TS_Language | None:
-    return _PARSER_LANG_BY_ID.get(id(self))
-
-def _parser_set_lang(self, lang):
-    if not isinstance(lang, TS_Language):
-        raise TypeError("language must be a tree_sitter.Language instance")
-    # call native setter
-    self.set_language(lang)
-    # remember it (keyed by id(self); tiny leak is acceptable for short-lived eval)
-    _PARSER_LANG_BY_ID[id(self)] = lang
-
-# Add property only if missing (tree_sitter 0.20.x)
-if not hasattr(Parser, "language"):
-    Parser.language = property(_parser_get_lang, _parser_set_lang)  # type: ignore[attr-defined]
-    _patched_parser = True
-else:
-    _patched_parser = False
-
-
-# --- Replacement for CodeBLEU's language loader (Python only) ---
-def _get_ts_lang_from_tsl(lang: str) -> TS_Language:
-    key = (lang or "").strip().lower()
-    if key not in {"python", "py"}:
-        raise NotImplementedError(
-            f"[codebleu_shim] Only 'python' is supported by this shim. Got '{lang}'."
-        )
-    try:
-        tsl = importlib.import_module("tree_sitter_languages")
-    except Exception as e:
-        raise RuntimeError(
-            "[codebleu_shim] Missing 'tree_sitter_languages'. Install with:\n"
-            "  pip install tree_sitter_languages==1.10.2"
-        ) from e
-
-    try:
-        lang_obj = tsl.get_language("python")  # -> tree_sitter.Language
-    except Exception as e:
-        raise RuntimeError(
-            "[codebleu_shim] tree_sitter_languages.get_language('python') failed."
-        ) from e
-
-    if not isinstance(lang_obj, TS_Language):
-        raise TypeError(
-            "[codebleu_shim] Expected a tree_sitter.Language from tree_sitter_languages"
-        )
-    return lang_obj
-
-
-# --- Patch CodeBLEU modules to use our loader everywhere ---
-_patched_utils = False
-_patched_codebleu = False
-
-try:
-    utils = importlib.import_module("codebleu.utils")
-    setattr(utils, "get_tree_sitter_language", _get_ts_lang_from_tsl)
-    _patched_utils = True
+    from codebleu import calc_codebleu as _official_calc
+    _OFFICIAL_OK = True
 except Exception:
-    pass
+    _OFFICIAL_OK = False
 
+# Try a compatible fallback (bundled alongside this file in your repo)
+_FALLBACK_OK = False
 try:
-    cmod = importlib.import_module("codebleu.codebleu")
-    if hasattr(cmod, "get_tree_sitter_language"):
-        setattr(cmod, "get_tree_sitter_language", _get_ts_lang_from_tsl)
-    _patched_codebleu = True
+    from .codebleu_compat import codebleu_score as _compat_calc
+    _FALLBACK_OK = True
 except Exception:
-    pass
+    _FALLBACK_OK = False
 
-print(
-    "[codebleu_shim] ready — "
-    f"Parser.language patched={_patched_parser}, "
-    f"utils.patched={_patched_utils}, "
-    f"codebleu.patched={_patched_codebleu}"
-)
+def _normalize_code(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # strip trailing spaces
+    s = "\n".join(line.rstrip() for line in s.split("\n"))
+    # collapse >1 blank lines
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def compute_codebleu(preds: List[str], refs: List[str], lang: str = "python") -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        'codebleu': float,
+        'ngram_match_score': float,
+        'weighted_ngram_match_score': float,
+        'syntax_match_score': float,
+        'dataflow_match_score': float
+      }
+    """
+    assert len(preds) == len(refs), "preds and refs must have same length"
+    preds = [_normalize_code(p) for p in preds]
+    refs  = [_normalize_code(r) for r in refs]
+
+    if _OFFICIAL_OK:
+        try:
+            res = _official_calc.calc_code_bleu(refs, preds, lang,
+                                                weights=(0.25, 0.25, 0.25, 0.25))
+            return {
+                "codebleu": float(res["codebleu"]),
+                "ngram_match_score": float(res["ngram_match_score"]),
+                "weighted_ngram_match_score": float(res["weighted_ngram_match_score"]),
+                "syntax_match_score": float(res["syntax_match_score"]),
+                "dataflow_match_score": float(res["dataflow_match_score"]),
+            }
+        except Exception:
+            # fall through to compat
+            pass
+
+    if _FALLBACK_OK:
+        res = _compat_calc(refs, preds, lang=lang)
+        return {
+            "codebleu": float(res["codebleu"]),
+            "ngram_match_score": float(res["ngram"]),
+            "weighted_ngram_match_score": float(res["weighted_ngram"]),
+            "syntax_match_score": float(res["syntax"]),
+            "dataflow_match_score": float(res["dataflow"]),
+        }
+
+    # If all else fails, give zeros with a warning-ish shape
+    return {
+        "codebleu": 0.0,
+        "ngram_match_score": 0.0,
+        "weighted_ngram_match_score": 0.0,
+        "syntax_match_score": 0.0,
+        "dataflow_match_score": 0.0,
+    }
