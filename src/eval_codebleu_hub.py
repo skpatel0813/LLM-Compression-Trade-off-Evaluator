@@ -1,37 +1,6 @@
 # src/eval_codebleu_hub.py
 # --------------------------------------------------------------------------------------------------
-# Evaluate a (base or LoRA-merged) model on JSONL chat data and push results to the Hugging Face Hub.
-#
-# Artifacts per run (saved under outputs/eval/<run_name>/ and uploaded to the Hub):
-#   - predictions_eval.jsonl : each line {"prompt", "ref", "hyp"}
-#   - metrics_eval.json      : {"model","rows","bleu4","codebleu", sub-scores, "dtype","wall_time_sec"}
-#   - gpu_trace.csv          : timestamp,gpu,util_pct,mem_used_MiB,mem_total_MiB,power_W
-#
-# Notes:
-#   - We try official `codebleu` first; if it errors, we fall back to `src.codebleu_compat`.
-#   - For decoder-only models (e.g., Llama 3.x), we set padding_side='left' to avoid subtle issues.
-#   - GPU monitoring is done in a Python thread; no shell one-liners that can break quoting.
-#
-# Quick usage:
-#   export HUGGINGFACE_HUB_TOKEN=hf_xxx
-#   CUDA_VISIBLE_DEVICES=0 "$CONDA_PREFIX/bin/python" -u -m src.eval_codebleu_hub \
-#     --base_id_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
-#     --eval_files data/codesearchnet_python_train.jsonl \
-#     --max_rows 200 \
-#     --seq_len 2048 \
-#     --max_new_tokens 256 \
-#     --bf16 True \
-#     --do_sample False \
-#     --hub_repo_id "username/llm-kd-evals" \
-#     --run_name "baseline-8B-noKD"
-#
-# Minimal deps:
-#   pip install -U transformers sacrebleu huggingface_hub
-#   # Optional (makes GPU trace richer):
-#   pip install -U pynvml
-#   # If you want official CodeBLEU:
-#   pip install -U codebleu
-#   # If official CodeBLEU fails, this script auto-falls back to src/codebleu_compat.py
+# FIXED: Better error handling and debugging for CodeBLEU syntax scoring
 # --------------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -47,20 +16,19 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------------------------------
-# Import the CodeBLEU shim FIRST (if present). Works both with `-m src.eval_codebleu_hub` and PYTHONPATH=src.
+# Import the CodeBLEU shim FIRST (if present)
 # --------------------------------------------------------------------------------------------------
 _SHIM = None
 try:
-    from src import codebleu_shim as _SHIM  # when run as a module
+    from src import codebleu_shim as _SHIM
 except Exception:
     try:
-        import codebleu_shim as _SHIM       # when PYTHONPATH includes ./src
+        import codebleu_shim as _SHIM
     except Exception:
         _SHIM = None
 
-if _SHIM is not None and getattr(_SHIM, "READY_MSG", None):
-    # Visible confirmation in logs that patching occurred
-    print(_SHIM.READY_MSG, file=sys.stderr)
+if _SHIM is not None:
+    print("[eval] CodeBLEU shim loaded", file=sys.stderr, flush=True)
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -83,27 +51,25 @@ except Exception:
 _USE_OFFICIAL_CODEBLEU = True
 _official_calc_codebleu = None
 try:
-    from codebleu import calc_codebleu as _official_calc_codebleu  # type: ignore
-except Exception:
+    from codebleu import calc_codebleu as _official_calc_codebleu
+    print("[eval] Official CodeBLEU imported successfully", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"[eval] Official CodeBLEU not available: {e}", file=sys.stderr, flush=True)
     _USE_OFFICIAL_CODEBLEU = False
 
 _compat_calc_codebleu = None
 try:
-    from src.codebleu_compat import calc_codebleu as _compat_calc_codebleu  # type: ignore
-except Exception:
-    _compat_calc_codebleu = None
+    from src.codebleu_compat import calc_codebleu as _compat_calc_codebleu
+    print("[eval] Compat CodeBLEU imported successfully", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"[eval] Compat CodeBLEU not available: {e}", file=sys.stderr, flush=True)
 
 
 # ---------------------------
 # Safe GPU monitor (Python thread)
 # ---------------------------
 class GPUMonitor:
-    """
-    Samples GPU utilization/memory/power into a CSV.
-    - Prefers pynvml (fine-grained and cheap)
-    - Falls back to 'nvidia-smi' if pynvml isn't available
-    If neither works, it silently does nothing.
-    """
+    """GPU monitoring with pynvml or nvidia-smi fallback"""
     def __init__(self, out_csv: str, interval_sec: float = 1.0):
         self.out_csv = out_csv
         self.interval = float(interval_sec)
@@ -133,7 +99,6 @@ class GPUMonitor:
                     f.flush()
                     self._stop.wait(self.interval)
             except Exception:
-                # fallback to smi if pynvml fails midway
                 pass
             finally:
                 try:
@@ -147,11 +112,8 @@ class GPUMonitor:
             while not self._stop.is_set():
                 try:
                     out = subprocess.check_output(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw",
-                            "--format=csv,noheader,nounits",
-                        ],
+                        ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw",
+                         "--format=csv,noheader,nounits"],
                         text=True,
                     )
                     ts = datetime.now().isoformat()
@@ -166,7 +128,7 @@ class GPUMonitor:
 
     def start(self):
         try:
-            import pynvml  # noqa: F401
+            import pynvml
             target = self._loop_pynvml
         except Exception:
             target = self._loop_smi
@@ -206,15 +168,9 @@ def load_jsonl(fp: str, max_rows: int) -> List[Dict[str, Any]]:
 
 
 def extract_prompt_and_ref(tokenizer, ex: Dict[str, Any]) -> Tuple[str, str, List[Dict[str, str]]]:
-    """
-    Expect lines like:
-      {"messages": [{"role":"user"/"assistant"/"system","content":"..."} , ...]}
-    Reference = last assistant message (if provided).
-    Prompt is built via tokenizer.apply_chat_template(..., add_generation_prompt=True).
-    """
+    """Extract prompt and reference from chat message format"""
     msgs: List[Dict[str, str]] = ex.get("messages", [])
     if not msgs:
-        # Fallback for single-field examples
         user = ex.get("user", "") or ex.get("prompt", "")
         msgs = [{"role": "user", "content": user}]
 
@@ -242,7 +198,6 @@ def maybe_merge_lora(model, lora_dir: Optional[str]):
     try:
         model = model.merge_and_unload()
     except Exception:
-        # If merge isn't supported, keep PEFT wrapper and continue
         pass
     return model
 
@@ -254,9 +209,7 @@ def load_model_and_tokenizer(
     fp16: Optional[bool],
     seq_len: int,
 ):
-    """
-    Auto-select dtype, set left-padding for decoder-only models, and load.
-    """
+    """Load model and tokenizer with auto dtype selection"""
     if torch.cuda.is_available():
         auto_bf16 = torch.cuda.is_bf16_supported()
         use_bf16 = bf16 if bf16 is not None else auto_bf16
@@ -269,7 +222,6 @@ def load_model_and_tokenizer(
     tok = AutoTokenizer.from_pretrained(base_id_or_path, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    # Critical for decoder-only generation correctness with batched prompts:
     tok.padding_side = "left"
     tok.model_max_length = seq_len
 
@@ -326,38 +278,73 @@ def compute_bleu4(refs: List[str], hyps: List[str]) -> float:
 
 def compute_codebleu(refs: List[str], hyps: List[str]) -> Dict[str, Optional[float]]:
     """
-    Returns normalized keys:
-      codebleu, codebleu_ngram, codebleu_weighted_ngram, codebleu_syntax, codebleu_dataflow
+    Compute CodeBLEU with detailed error reporting.
+    Returns normalized keys with proper debugging output.
     """
+    print(f"\n[CodeBLEU] Computing for {len(refs)} examples", file=sys.stderr, flush=True)
+    
+    # Show sample data for debugging
+    if refs and hyps:
+        print(f"[CodeBLEU] Sample ref (first 100 chars): {refs[0][:100]!r}", file=sys.stderr, flush=True)
+        print(f"[CodeBLEU] Sample hyp (first 100 chars): {hyps[0][:100]!r}", file=sys.stderr, flush=True)
+    
     # Try official package first
     if _USE_OFFICIAL_CODEBLEU and _official_calc_codebleu is not None:
         try:
+            print("[CodeBLEU] Trying official codebleu package...", file=sys.stderr, flush=True)
             out = _official_calc_codebleu(refs, hyps, lang="python")
-            return {
+            print(f"[CodeBLEU] Official result: {out}", file=sys.stderr, flush=True)
+            
+            result = {
                 "codebleu": float(out.get("codebleu", out.get("code_bleu", float("nan")))),
-                "codebleu_ngram": float(out.get("ngram_match", out.get("ngram_match_score", float("nan")))),
-                "codebleu_weighted_ngram": float(out.get("weighted_ngram_match", out.get("weighted_ngram_match_score", float("nan")))),
-                "codebleu_syntax": float(out.get("syntax_match", out.get("syntax_match_score", float("nan")))),
-                "codebleu_dataflow": float(out.get("dataflow_match", out.get("dataflow_match_score", float("nan")))),
+                "codebleu_ngram": float(out.get("ngram_match_score", out.get("ngram_match", float("nan")))),
+                "codebleu_weighted_ngram": float(out.get("weighted_ngram_match_score", out.get("weighted_ngram_match", float("nan")))),
+                "codebleu_syntax": float(out.get("syntax_match_score", out.get("syntax_match", float("nan")))),
+                "codebleu_dataflow": float(out.get("dataflow_match_score", out.get("dataflow_match", float("nan")))),
             }
+            
+            # Check for zero syntax score
+            if result["codebleu_syntax"] == 0.0:
+                print("[CodeBLEU] WARNING: Official package returned 0.0 for syntax_match!", file=sys.stderr, flush=True)
+                print("[CodeBLEU]          This may indicate tree-sitter parsing issues.", file=sys.stderr, flush=True)
+            
+            return result
+            
         except Exception as e:
-            print(f"[WARN] Official CodeBLEU failed: {e}\n       Falling back to codebleu_compat.", file=sys.stderr)
+            print(f"[CodeBLEU] Official package FAILED: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            print("[CodeBLEU] Falling back to codebleu_compat...", file=sys.stderr, flush=True)
 
-    # Fallback: local compat (no fragile CodeXGLUE deps)
+    # Fallback: local compat
     if _compat_calc_codebleu is not None:
         try:
+            print("[CodeBLEU] Using codebleu_compat fallback...", file=sys.stderr, flush=True)
             out = _compat_calc_codebleu(refs, hyps, lang="python")
-            return {
+            print(f"[CodeBLEU] Compat result: {out}", file=sys.stderr, flush=True)
+            
+            result = {
                 "codebleu": float(out["codebleu"]),
                 "codebleu_ngram": float(out["ngram_match"]),
                 "codebleu_weighted_ngram": float(out["weighted_ngram_match"]),
                 "codebleu_syntax": float(out["syntax_match"]),
-                "codebleu_dataflow": float(out["dataflow_match"]),  # likely 0.0 in compat
+                "codebleu_dataflow": float(out["dataflow_match"]),
             }
+            
+            # Check for zero syntax score
+            if result["codebleu_syntax"] == 0.0:
+                print("[CodeBLEU] WARNING: Compat returned 0.0 for syntax_match!", file=sys.stderr, flush=True)
+                print("[CodeBLEU]          Check tree-sitter installation and code validity.", file=sys.stderr, flush=True)
+            
+            return result
+            
         except Exception as e:
-            print(f"[WARN] codebleu_compat failed: {e}\n       Setting CodeBLEU metrics to NaN.", file=sys.stderr)
+            print(f"[CodeBLEU] Compat FAILED: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
 
-    # If both paths fail, return NaNs
+    # Both failed
+    print("[CodeBLEU] ERROR: Both official and compat failed! Returning NaNs.", file=sys.stderr, flush=True)
     return {
         "codebleu": float("nan"),
         "codebleu_ngram": float("nan"),
@@ -380,7 +367,6 @@ def hf_upload_dir(repo_id: str, run_dir: str, local_dir: str, token: str):
     try:
         create_repo(repo_id, token=token, repo_type="dataset", exist_ok=True)
     except Exception:
-        # If it already exists (dataset or model repo), keep going.
         pass
 
     for root, _, files in os.walk(local_dir):
@@ -417,12 +403,10 @@ def parse_args():
     ap.add_argument("--bf16", type=str, default=None, help="True/False; default auto if supported")
     ap.add_argument("--fp16", type=str, default=None, help="True/False; default opposite of bf16")
 
-    # HF Hub
-    ap.add_argument("--hub_repo_id", required=True, help='e.g. "username/llm-kd-evals" (dataset repo recommended)')
+    ap.add_argument("--hub_repo_id", required=True, help='e.g. "username/llm-kd-evals"')
     ap.add_argument("--run_name", default=None, help="Subfolder name. If omitted, use model+timestamp")
     ap.add_argument("--hf_token", default=None, help="Token override; else env/cached login")
 
-    # GPU monitor
     ap.add_argument("--gpu_poll_sec", type=float, default=1.0, help="GPU polling interval seconds")
 
     return ap.parse_args()
@@ -456,9 +440,11 @@ def main():
     t0 = time.time()
 
     # Load model/tokenizer (+ optional LoRA merge)
+    print(f"\n[eval] Loading model: {args.base_id_or_path}", flush=True)
     tokenizer, model, dtype = load_model_and_tokenizer(
         args.base_id_or_path, args.lora_dir, bf16, fp16, args.seq_len
     )
+    print(f"[eval] Model loaded with dtype: {dtype}", flush=True)
 
     # Read & cap rows
     rows: List[Dict[str, Any]] = []
@@ -469,6 +455,8 @@ def main():
         chunk = load_jsonl(fp, max_rows=remaining)
         rows.extend(chunk)
         remaining -= len(chunk)
+    
+    print(f"[eval] Loaded {len(rows)} examples for evaluation", flush=True)
 
     # Build prompts/refs
     prompts: List[str] = []
@@ -479,9 +467,12 @@ def main():
         refs.append(r)
 
     # Generate in batches
+    print(f"[eval] Generating predictions (batch_size=8)...", flush=True)
     hyps: List[str] = []
     B = 8
     for i in range(0, len(prompts), B):
+        if i % 50 == 0:
+            print(f"[eval] Progress: {i}/{len(prompts)}", flush=True)
         batch_prompts = prompts[i : i + B]
         batch_out = generate_batch(
             tokenizer, model, batch_prompts,
@@ -491,15 +482,23 @@ def main():
             temperature=args.temperature,
         )
         hyps.extend(batch_out)
+    
+    print(f"[eval] Generation complete: {len(hyps)} predictions", flush=True)
 
     # Save predictions
     with open(preds_path, "w", encoding="utf-8") as f:
         for p, r, h in zip(prompts, refs, hyps):
             f.write(json.dumps({"prompt": p, "ref": r, "hyp": h}, ensure_ascii=False) + "\n")
+    print(f"[eval] Predictions saved to: {preds_path}", flush=True)
 
     # Metrics
+    print("\n[eval] Computing BLEU-4...", flush=True)
     bleu4 = compute_bleu4(refs, hyps)
+    print(f"[eval] BLEU-4: {bleu4:.4f}", flush=True)
+    
+    print("\n[eval] Computing CodeBLEU...", flush=True)
     cb = compute_codebleu(refs, hyps)
+    
     wall = time.time() - t0
 
     metrics = {
@@ -510,34 +509,43 @@ def main():
         "dtype": "bf16" if dtype == torch.bfloat16 else ("fp16" if dtype == torch.float16 else "fp32"),
         "wall_time_sec": round(float(wall), 2),
         # CodeBLEU (handle NaNs safely)
-        "codebleu": None if math.isnan(cb["codebleu"]) else float(cb["codebleu"]),
-        "codebleu_ngram": None if math.isnan(cb["codebleu_ngram"]) else float(cb["codebleu_ngram"]),
-        "codebleu_weighted_ngram": None if math.isnan(cb["codebleu_weighted_ngram"]) else float(cb["codebleu_weighted_ngram"]),
-        "codebleu_syntax": None if math.isnan(cb["codebleu_syntax"]) else float(cb["codebleu_syntax"]),
-        "codebleu_dataflow": None if math.isnan(cb["codebleu_dataflow"]) else float(cb["codebleu_dataflow"]),
+        "codebleu": None if math.isnan(cb["codebleu"]) else round(float(cb["codebleu"]), 4),
+        "codebleu_ngram": None if math.isnan(cb["codebleu_ngram"]) else round(float(cb["codebleu_ngram"]), 4),
+        "codebleu_weighted_ngram": None if math.isnan(cb["codebleu_weighted_ngram"]) else round(float(cb["codebleu_weighted_ngram"]), 4),
+        "codebleu_syntax": None if math.isnan(cb["codebleu_syntax"]) else round(float(cb["codebleu_syntax"]), 4),
+        "codebleu_dataflow": None if math.isnan(cb["codebleu_dataflow"]) else round(float(cb["codebleu_dataflow"]), 4),
     }
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
+    print(f"[eval] Metrics saved to: {metrics_path}", flush=True)
 
     # Stop GPU monitor
     mon.stop()
 
     # Push artifacts to Hub
-    token = ensure_hf_token(args.hf_token)
-    run_dir_in_repo = f"runs/{run_name}"
-    hf_upload_dir(args.hub_repo_id, run_dir_in_repo, out_dir, token)
+    try:
+        token = ensure_hf_token(args.hf_token)
+        run_dir_in_repo = f"runs/{run_name}"
+        print(f"\n[eval] Uploading to HF Hub: {args.hub_repo_id}/{run_dir_in_repo}", flush=True)
+        hf_upload_dir(args.hub_repo_id, run_dir_in_repo, out_dir, token)
+        print(f"[eval] Upload complete!", flush=True)
+    except Exception as e:
+        print(f"[eval] Hub upload failed (continuing anyway): {e}", file=sys.stderr, flush=True)
 
     # Console summary
-    print("\n=== EVAL DONE ===")
-    print("predictions :", preds_path)
-    print("metrics     :", metrics_path)
-    print("gpu trace   :", gpu_csv)
-    print(f"pushed to   : hf://{args.hub_repo_id}/{run_dir_in_repo}/")
+    print("\n" + "="*60)
+    print("EVALUATION COMPLETE")
+    print("="*60)
+    print(f"Predictions : {preds_path}")
+    print(f"Metrics     : {metrics_path}")
+    print(f"GPU trace   : {gpu_csv}")
+    print(f"Hub location: {args.hub_repo_id}/runs/{run_name}/")
+    print("\nMetrics:")
     print(json.dumps(metrics, indent=2))
+    print("="*60)
 
 
 if __name__ == "__main__":
-    # Small perf nicety
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
