@@ -1,125 +1,188 @@
-# -*- coding: utf-8 -*-
-"""
-Compact, dependency-light CodeBLEU-compatible scorer.
-
-This is NOT a perfect reimplementation of CodeBLEU. It:
-- approximates n-gram & weighted n-gram via sentencepiece-free token n-grams
-- approximates syntax/dataflow by (a) parsability via ast for Python and
-  (b) simple identifier graph overlap.
-
-The goal is robustness + directionally-correct signals when official package
-is unavailable or fragile in your environment.
-"""
+# src/codebleu_compat.py
+# ------------------------------------------------------------------------------------
+# Minimal, dependency-light CodeBLEU for Python.
+# - BLEU-4 via sacrebleu
+# - Weighted n-gram using Python keywords as weights
+# - Syntax match via tree_sitter (Python grammar)
+# - Dataflow match is set to 0.0 (no packaged DFG extractor for Python)
+#
+# Returns a dict compatible with the 'codebleu' PyPI package:
+#   {
+#     "codebleu": float,                   # overall (avg of 4 parts)
+#     "ngram_match": float,
+#     "weighted_ngram_match": float,
+#     "syntax_match": float,
+#     "dataflow_match": float
+#   }
+# ------------------------------------------------------------------------------------
 
 from __future__ import annotations
-import ast
-import re
-from collections import Counter
-from typing import List, Dict, Any
+from typing import List, Dict, Tuple
+import keyword
+import math
 
-def _tok_lines(s: str) -> List[str]:
-    s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
-    return [t for t in re.split(r"(\W+)", s) if t and not t.isspace()]
+# sacrebleu for BLEU-4 / tokenization
+try:
+    import sacrebleu
+except Exception as e:
+    raise RuntimeError("codebleu_compat.py requires 'sacrebleu' (pip install sacrebleu).") from e
 
-def _ngram_counter(tokens: List[str], n: int) -> Counter:
-    return Counter(tuple(tokens[i:i+n]) for i in range(0, len(tokens)-n+1))
+# tree-sitter Python grammar
+try:
+    from tree_sitter import Parser
+    import tree_sitter_python as tsp  # provides tree-sitter Python grammar capsule
+except Exception as e:
+    raise RuntimeError(
+        "codebleu_compat.py needs tree-sitter + tree-sitter-python. "
+        "Install e.g.: pip install 'tree-sitter==0.22.3' 'tree-sitter-python==0.23.4'"
+    ) from e
 
-def _ngram_f1(ref: List[str], hyp: List[str], n: int) -> float:
-    cr = _ngram_counter(ref, n)
-    ch = _ngram_counter(hyp, n)
-    overlap = sum((cr & ch).values())
-    pr = sum(ch.values()) or 1
-    re = sum(cr.values()) or 1
-    precision = overlap / pr
-    recall = overlap / re
-    if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
 
-def _weighted_ngram_score(ref: List[str], hyp: List[str]) -> float:
-    # simple weights favoring keywords/idents
-    w = Counter()
-    for t in ref:
-        if re.match(r"[A-Za-z_]\w*$", t):
-            w[t] += 3
-        else:
-            w[t] += 1
-    hit = 0
-    total = 0
-    for i, t in enumerate(hyp):
-        total += w.get(t, 1)
-        if i < len(ref) and t == ref[i]:
-            hit += w.get(t, 1)
-    return hit / total if total else 0.0
+# ---------------------------
+# Utility: n-grams & weights
+# ---------------------------
+PY_KEYWORDS = set(keyword.kwlist)
 
-def _syntax_score_py(ref: str, hyp: str) -> float:
-    # 1. both parsable -> 1.0 ; only hyp parsable -> 0.5 ; else 0
+def tokenize_python(code: str) -> List[str]:
+    # ultra-simple whitespace tokenization (good enough for BLEU-style counts)
+    return code.strip().split()
+
+def ngrams(tokens: List[str], n: int) -> List[Tuple[str, ...]]:
+    return [tuple(tokens[i:i+n]) for i in range(0, max(0, len(tokens)-n+1))]
+
+def ngram_match_score(refs: List[str], hyps: List[str], max_n: int = 4) -> float:
+    # Use sacrebleu BLEU-4, which already handles clipping etc.
+    bleu = sacrebleu.corpus_bleu(hyps, [refs], force=True, tokenize="intl", smooth_method="exp")
+    return float(bleu.score / 100.0)
+
+def weighted_ngram_match_score(refs: List[str], hyps: List[str], max_n: int = 4) -> float:
+    # Assign extra weight to n-grams containing Python keywords
+    def weight_of_ng(ng: Tuple[str, ...]) -> float:
+        # weight base 1.0, +0.5 if contains keyword
+        return 1.0 + (0.5 if any(tok in PY_KEYWORDS for tok in ng) else 0.0)
+
+    ref_tokens = [tokenize_python(r) for r in refs]
+    hyp_tokens = [tokenize_python(h) for h in hyps]
+
+    scores = []
+    for r_tok, h_tok in zip(ref_tokens, hyp_tokens):
+        per_n_scores = []
+        for n in range(1, max_n + 1):
+            r_ngrams = ngrams(r_tok, n)
+            h_ngrams = ngrams(h_tok, n)
+            if not r_ngrams:
+                # degenerate case
+                per_n_scores.append(1.0 if not h_ngrams else 0.0)
+                continue
+
+            # weighted precision = sum(min(count_h, count_r) * w) / sum(count_h * w)
+            from collections import Counter
+            rc = Counter(r_ngrams)
+            hc = Counter(h_ngrams)
+
+            num = 0.0
+            den = 0.0
+            for ng, hcount in hc.items():
+                w = weight_of_ng(ng)
+                den += hcount * w
+                num += min(hcount, rc.get(ng, 0)) * w
+
+            p_n = (num / den) if den > 0 else 0.0
+            per_n_scores.append(p_n)
+
+        # geometric mean over up to 4 n-gram precisions (BLEU-style)
+        gm = math.exp(sum((math.log(max(s, 1e-12)) for s in per_n_scores)) / max_n)
+        scores.append(gm)
+
+    return float(sum(scores) / max(len(scores), 1))
+
+
+# ---------------------------
+# Syntax match via tree-sitter
+# ---------------------------
+# We’ll parse both ref & hyp and compute a simple tree-structure similarity:
+# similarity = 2 * |common node types| / (|types_ref| + |types_hyp|)
+#
+# This is a lightweight proxy to CodeXGLUE's more involved syntax match and is
+# consistent & stable across environments (no custom shared objects needed).
+
+def _python_language_capsule():
+    # For tree-sitter-python>=0.23, tsp.language() returns a PyCapsule the Parser understands
+    return tsp.language()
+
+def _parser():
+    p = Parser()
+    # Newer tree_sitter allows setting capsule directly:
+    #   parser.language = <Language or capsule>
+    # If your installed wheel prefers set_language(), we’ll try that too.
+    lang = _python_language_capsule()
     try:
-        ast.parse(ref)
-        ref_ok = True
+        p.language = lang
     except Exception:
-        ref_ok = False
-    try:
-        ast.parse(hyp)
-        hyp_ok = True
-    except Exception:
-        hyp_ok = False
-    if ref_ok and hyp_ok:
-        return 1.0
-    if hyp_ok:
-        return 0.5
+        p.set_language(lang)
+    return p
+
+def _node_types_from_code(code: str) -> List[str]:
+    p = _parser()
+    tree = p.parse(bytes(code, "utf-8"))
+    types = []
+
+    def walk(node):
+        types.append(node.type)
+        for i in range(node.child_count):
+            walk(node.children[i])
+
+    walk(tree.root_node)
+    return types
+
+def syntax_match_score(refs: List[str], hyps: List[str]) -> float:
+    import collections
+    scores = []
+    for r, h in zip(refs, hyps):
+        types_r = collections.Counter(_node_types_from_code(r))
+        types_h = collections.Counter(_node_types_from_code(h))
+
+        # multiset intersection size
+        common = 0
+        for t, cr in types_r.items():
+            if t in types_h:
+                common += min(cr, types_h[t])
+
+        total = sum(types_r.values()) + sum(types_h.values())
+        s = (2.0 * common / total) if total > 0 else 1.0
+        scores.append(s)
+
+    return float(sum(scores) / max(len(scores), 1))
+
+
+# ---------------------------
+# Dataflow match (stub=0.0)
+# ---------------------------
+def dataflow_match_score(refs: List[str], hyps: List[str]) -> float:
+    # Proper DFG extraction requires a custom analyzer; we return 0.0 to keep the
+    # metric defined. If you later integrate a DFG extractor, wire it here.
     return 0.0
 
-def _idents(s: str) -> Counter:
-    return Counter(re.findall(r"[A-Za-z_]\w*", s))
 
-def _dataflow_score_py(ref: str, hyp: str) -> float:
-    # crude identifier overlap Jaccard on multiset min/sum
-    R = _idents(ref)
-    H = _idents(hyp)
-    if not R and not H:
-        return 1.0
-    inter = sum((R & H).values())
-    denom = sum((R | H).values()) or 1
-    return inter / denom
+# ---------------------------
+# Public API (drop-in)
+# ---------------------------
+def calc_codebleu(refs: List[str], hyps: List[str], lang: str = "python", weights=(0.25, 0.25, 0.25, 0.25)) -> Dict[str, float]:
+    if lang.lower() not in {"python", "py"}:
+        raise NotImplementedError("codebleu_compat.py currently supports lang='python' only.")
 
-def codebleu_score(refs: List[str], hyps: List[str], lang: str = "python") -> Dict[str, Any]:
-    assert len(refs) == len(hyps)
-    n = len(refs)
-    if n == 0:
-        return {"codebleu": 0.0, "ngram": 0.0, "weighted_ngram": 0.0, "syntax": 0.0, "dataflow": 0.0}
+    ngram = ngram_match_score(refs, hyps)
+    weighted = weighted_ngram_match_score(refs, hyps)
+    syntax = syntax_match_score(refs, hyps)
+    dataflow = dataflow_match_score(refs, hyps)
 
-    ngram_scores = []
-    weighted_scores = []
-    syntax_scores = []
-    dataflow_scores = []
+    w1, w2, w3, w4 = weights
+    overall = w1 * ngram + w2 * weighted + w3 * syntax + w4 * dataflow
 
-    for ref, hyp in zip(refs, hyps):
-        tr = _tok_lines(ref)
-        th = _tok_lines(hyp)
-
-        # ngram avg F1 for n=1..4
-        ng = sum(_ngram_f1(tr, th, k) for k in (1,2,3,4)) / 4.0
-        wg = _weighted_ngram_score(tr, th)
-
-        if lang == "python":
-            syn = _syntax_score_py(ref, hyp)
-            df  = _dataflow_score_py(ref, hyp)
-        else:
-            # fallback if other languages show up
-            syn = 1.0 if hyp.strip() else 0.0
-            df  = 0.0
-
-        ngram_scores.append(ng)
-        weighted_scores.append(wg)
-        syntax_scores.append(syn)
-        dataflow_scores.append(df)
-
-    res = {
-        "ngram": float(sum(ngram_scores) / n),
-        "weighted_ngram": float(sum(weighted_scores) / n),
-        "syntax": float(sum(syntax_scores) / n),
-        "dataflow": float(sum(dataflow_scores) / n),
+    return {
+        "codebleu": float(overall),
+        "ngram_match": float(ngram),
+        "weighted_ngram_match": float(weighted),
+        "syntax_match": float(syntax),
+        "dataflow_match": float(dataflow),
     }
-    res["codebleu"] = 0.25 * (res["ngram"] + res["weighted_ngram"] + res["syntax"] + res["dataflow"])
-    return res
