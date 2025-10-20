@@ -112,14 +112,15 @@ def _python_language_capsule():
 
 def _parser():
     p = Parser()
-    # Newer tree_sitter allows setting capsule directly:
-    #   parser.language = <Language or capsule>
-    # If your installed wheel prefers set_language(), we’ll try that too.
-    lang = _python_language_capsule()
+    # Get the language capsule/object first
+    lang_obj = _python_language_capsule()
+    
+    # Try new API first (0.22.x+), then fall back to old API (0.20.x, 0.21.x)
     try:
-        p.language = lang
-    except Exception:
-        p.set_language(lang)
+        p.language = lang_obj
+    except AttributeError:
+        # Old API: use set_language() method
+        p.set_language(lang_obj)
     return p
 
 def _node_types_from_code(code: str) -> List[str]:
