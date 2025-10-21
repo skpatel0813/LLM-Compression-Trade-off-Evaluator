@@ -29,12 +29,12 @@ except Exception as e:
 
 # tree-sitter Python grammar
 try:
-    from tree_sitter import Parser
-    import tree_sitter_python as tsp  # provides tree-sitter Python grammar capsule
+    from tree_sitter import Parser, Language
+    from tree_sitter_languages import get_language
 except Exception as e:
     raise RuntimeError(
-        "codebleu_compat.py needs tree-sitter + tree-sitter-python. "
-        "Install e.g.: pip install 'tree-sitter==0.22.3' 'tree-sitter-python==0.23.4'"
+        "codebleu_compat.py needs tree-sitter + tree-sitter-languages. "
+        "Install: pip install 'tree-sitter==0.20.4' 'tree-sitter-languages==1.10.2'"
     ) from e
 
 
@@ -107,20 +107,13 @@ def weighted_ngram_match_score(refs: List[str], hyps: List[str], max_n: int = 4)
 # consistent & stable across environments (no custom shared objects needed).
 
 def _python_language_capsule():
-    # For tree-sitter-python>=0.23, tsp.language() returns a PyCapsule the Parser understands
-    return tsp.language()
+    # Use tree-sitter-languages which provides proper Language objects
+    return get_language('python')
 
 def _parser():
     p = Parser()
-    # Get the language capsule/object first
-    lang_obj = _python_language_capsule()
-    
-    # Try new API first (0.22.x+), then fall back to old API (0.20.x, 0.21.x)
-    try:
-        p.language = lang_obj
-    except AttributeError:
-        # Old API: use set_language() method
-        p.set_language(lang_obj)
+    lang = _python_language_capsule()
+    p.set_language(lang)
     return p
 
 def _node_types_from_code(code: str) -> List[str]:
@@ -160,14 +153,11 @@ def syntax_match_score(refs: List[str], hyps: List[str]) -> float:
 # Dataflow match (stub=0.0)
 # ---------------------------
 def dataflow_match_score(refs: List[str], hyps: List[str]) -> float:
-    # Proper DFG extraction requires a custom analyzer; we return 0.0 to keep the
-    # metric defined. If you later integrate a DFG extractor, wire it here.
-    return 0.0
-
-
-# ---------------------------
-# Public API (drop-in)
-# ---------------------------
+    try:
+        from .dataflow_extractor import compute_dataflow_match
+        return compute_dataflow_match(refs, hyps)
+    except Exception:
+        return 0.0
 def calc_codebleu(refs: List[str], hyps: List[str], lang: str = "python", weights=(0.25, 0.25, 0.25, 0.25)) -> Dict[str, float]:
     if lang.lower() not in {"python", "py"}:
         raise NotImplementedError("codebleu_compat.py currently supports lang='python' only.")

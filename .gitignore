@@ -31,3 +31,33 @@ hf_cache_isolated/
 mlflow_ui.log
 spate336*
 src/eval_codebleu_mlflow.py.bak*
+
+# Evaluation outputs
+outputs/
+results/
+reports/
+hf_cache/
+hf_cache_isolated/
+test_data/
+
+# Backup files
+*.bak
+*.pre_*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+__init__.py
+
+# Test files
+test_*.py
+fix_*.py
+
+# External repos
+CodeXGLUE/
+
+# Misc
+*.swp
+*.swo
+*~
