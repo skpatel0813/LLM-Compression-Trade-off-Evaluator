@@ -1,33 +1,40 @@
 # src/data_prep.py
 """
-Reliable data preparation for shared computers where downloading datasets might crash.
+MBPP dataset preparation for knowledge distillation training.
 
-This script safely downloads coding examples and turns them into chat conversations.
-It has two ways to work:
-  • Method 1: Download small pieces and keep them in memory (like reading a short book)
-  • Method 2: Stream data like watching a video if Method 1 doesn't work
+This script downloads the MBPP (Mostly Basic Programming Problems) dataset
+and converts it into chat conversation format for training.
+
+MBPP contains:
+  - ~374 training examples
+  - ~90 validation examples  
+  - ~500 test examples
+  
+Total: ~974 Python programming problems with test cases
 
 What we create:
-  data/opencodeinstruct_python_train.jsonl
-  data/codesearchnet_python_train.jsonl
+  data/mbpp_train.jsonl
+  data/mbpp_val.jsonl
+  data/mbpp_test.jsonl
 
-Settings you can change:
-  # For Method 1 (small pieces)
-  OCI_PCT=1   CSN_PCT=1
+Environment variables (optional):
+  MBPP_VARIANT="sanitized" or "full" (default: sanitized)
+  HF_HOME="$PWD/hf_cache"
+  HF_DATASETS_CACHE="$PWD/hf_cache/datasets"
 
-  # For Method 2 (streaming with limits)
-  OCI_MAX=200000  CSN_MAX=100000
-
-To keep things tidy:
+Usage:
+  python -m src.data_prep
+  
+  # Or with custom cache location:
   export HF_HOME="$PWD/hf_cache"
   export HF_DATASETS_CACHE="$PWD/hf_cache/datasets"
+  python -m src.data_prep
 """
 
 from __future__ import annotations
 import os
 import json
-import itertools
-from typing import Optional
+from typing import Dict, List, Any
 
 # Where we'll save our conversation files
 OUTDIR = "data"
@@ -37,248 +44,299 @@ os.makedirs(OUTDIR, exist_ok=True)
 ISOLATED_CACHE = os.path.join(os.getcwd(), "hf_cache_isolated")
 os.makedirs(ISOLATED_CACHE, exist_ok=True)
 
-def has_pyarrow() -> bool:
-    """Check if we have the special tool that helps read data faster"""
-    try:
-        import pyarrow  # noqa: F401
-        return True
-    except Exception:
-        return False
+# Respect custom HF caches if provided
+for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
+    v = os.environ.get(env_var)
+    if v:
+        os.makedirs(v, exist_ok=True)
 
-def env_int(name: str, default: int) -> int:
-    """Read numbers from settings, use default if not provided"""
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return default
 
-# How much data to take for Method 1 (like taking 1% of a big cake)
-OCI_PCT = env_int("OCI_PCT", 1)    # Take 1% of OpenCodeInstruct
-CSN_PCT = env_int("CSN_PCT", 1)    # Take 1% of CodeSearchNet
-
-# How many examples to take for Method 2 (like counting how many candies to take)
-OCI_MAX = env_int("OCI_MAX", 200_000)  # Maximum 200,000 from OpenCodeInstruct
-CSN_MAX = env_int("CSN_MAX", 100_000)  # Maximum 100,000 from CodeSearchNet
-
-def to_chat(instruction: str, _input: str, output: str) -> dict:
-    """Turn coding examples into friendly chat conversations"""
+def to_chat(prompt: str, code: str, test_cases: List[str]) -> Dict[str, Any]:
+    """
+    Turn MBPP examples into friendly chat conversations.
+    
+    Args:
+        prompt: The problem description (e.g., "Write a function to find the minimum cost path")
+        code: The solution code
+        test_cases: List of test assertions (e.g., ["min_cost([[1,2,3],[4,5,6]], 2, 2) == 8"])
+    
+    Returns:
+        Dictionary with 'messages' key containing the conversation
+    """
     system = (
         "You are a helpful Python coding assistant. "
         "Write clean, working code and include simple tests when helpful."
     )
-    user = (instruction or "")
-    if _input:
-        user += ("\n" + _input)
+    
+    # Build user message: problem description + test cases
+    user_content = prompt.strip()
+    
+    # Add test cases if available (helps student understand requirements)
+    if test_cases:
+        user_content += "\n\nTest cases:\n"
+        # Include up to 3 test cases for context
+        for i, test_case in enumerate(test_cases[:3], 1):
+            user_content += f"{i}. assert {test_case}\n"
+    
     return {
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": output or ""},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": code.strip()},
         ]
     }
 
-def is_python_lang(ex) -> bool:
-    """Check if this example is written in Python (like checking if a book is in English)"""
-    lang = (ex.get("language") or "").lower()
-    return ("python" in lang) or (lang == "py") or (lang.endswith("/python"))
 
-def delete_dataset_cache_like(substr_list) -> None:
+def prepare_mbpp_data() -> None:
     """
-    Clean up old downloaded data that might cause problems.
-    Like cleaning your room before starting a new project.
+    Download and prepare MBPP dataset in chat conversation format.
+    
+    MBPP has two variants:
+      - "sanitized": Cleaned version with ~974 examples (recommended)
+      - "full": Original version with ~1000 examples
+    
+    We use "sanitized" by default as it has better quality.
     """
-    # Look in different places where data might be stored
-    roots = []
-    # First check if user told us where to look
-    if os.environ.get("HF_DATASETS_CACHE"):
-        roots.append(os.environ["HF_DATASETS_CACHE"])
-    # Check our project folders
-    roots.append(os.path.join(os.getcwd(), "hf_cache", "datasets"))
-    roots.append(os.path.join(os.getcwd(), "hf_cache_isolated", "datasets"))
-    # Check the usual hiding spot
-    roots.append(os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "datasets"))
-
-    seen = set()
-    for root in roots:
-        if not root or not os.path.isdir(root): 
+    from datasets import load_dataset
+    
+    # Choose MBPP variant (sanitized is recommended)
+    variant = os.environ.get("MBPP_VARIANT", "sanitized").lower()
+    if variant not in ["sanitized", "full"]:
+        print(f"[warning] Unknown MBPP_VARIANT '{variant}', using 'sanitized'")
+        variant = "sanitized"
+    
+    print("="*70)
+    print(f"MBPP Dataset Preparation (variant: {variant})")
+    print("="*70)
+    
+    # Load MBPP dataset from Hugging Face
+    print(f"\n[1/4] Downloading MBPP '{variant}' dataset from Hugging Face...")
+    try:
+        dataset = load_dataset(
+            "mbpp",
+            name=variant,
+            cache_dir=ISOLATED_CACHE,
+            download_mode="reuse_cache_if_exists",
+        )
+        print("✓ Dataset downloaded successfully")
+    except Exception as e:
+        print(f"✗ Failed to download MBPP dataset: {e}")
+        print("\nTroubleshooting:")
+        print("  1. Check internet connection")
+        print("  2. Try: pip install datasets --upgrade")
+        print("  3. Clear cache: rm -rf hf_cache_isolated/")
+        raise
+    
+    # Process each split
+    splits_to_process = [
+        ("train", "mbpp_train.jsonl", "Training"),
+        ("validation", "mbpp_val.jsonl", "Validation"),
+        ("test", "mbpp_test.jsonl", "Test"),
+    ]
+    
+    total_examples = 0
+    
+    for split_name, output_filename, display_name in splits_to_process:
+        if split_name not in dataset:
+            print(f"\n[warning] Split '{split_name}' not found in dataset, skipping...")
             continue
-        for name in os.listdir(root):
-            path = os.path.join(root, name)
-            if not os.path.isdir(path): 
-                continue
-            low = name.lower()
-            # If this folder matches what we're looking for, clean it up
-            if any(s in low for s in substr_list):
-                if path in seen: 
+        
+        print(f"\n[{splits_to_process.index((split_name, output_filename, display_name)) + 2}/4] Processing {display_name} split...")
+        
+        split_data = dataset[split_name]
+        output_path = os.path.join(OUTDIR, output_filename)
+        
+        rows_written = 0
+        skipped = 0
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            for example in split_data:
+                # Extract fields from MBPP format
+                task_id = example.get("task_id", -1)
+                prompt = example.get("text", "").strip()
+                code = example.get("code", "").strip()
+                test_list = example.get("test_list", [])
+                
+                # Skip examples with missing critical fields
+                if not prompt or not code:
+                    skipped += 1
                     continue
-                print(f"[info] Cleaning up old data: {path}")
-                seen.add(path)
+                
+                # Convert to chat format
                 try:
-                    import shutil
-                    shutil.rmtree(path)
+                    chat_record = to_chat(
+                        prompt=prompt,
+                        code=code,
+                        test_cases=test_list
+                    )
+                    
+                    # Add metadata for tracking
+                    chat_record["task_id"] = task_id
+                    chat_record["split"] = split_name
+                    
+                    # Write to JSONL file
+                    f.write(json.dumps(chat_record, ensure_ascii=False) + "\n")
+                    rows_written += 1
+                    
                 except Exception as e:
-                    print(f"[warn] Couldn't clean {path}: {e}")
-
-# ---------------------- METHOD 1: NON-STREAMING (like reading a book) -------------------------------------
-
-def prepare_non_streaming() -> None:
-    """
-    Download small pieces of data and keep them in memory.
-    Like borrowing a few books from the library instead of the whole shelf.
-    """
-    from datasets import load_dataset
-
-    # 1) Get Python coding examples from OpenCodeInstruct
-    oci_split = f"train[:{OCI_PCT}%]"
-    print(f"[Method 1] Getting {OCI_PCT}% of OpenCodeInstruct examples (keeping in memory)")
-    oci = load_dataset(
-        "nvidia/OpenCodeInstruct",
-        split=oci_split,
-        cache_dir=ISOLATED_CACHE,
-        keep_in_memory=True,               # <- Important: keep everything in memory
-        download_mode="reuse_cache_if_exists",
-    )
-    # Only keep Python examples
-    oci_py = oci.filter(is_python_lang)
-
-    # Save as conversation file
-    oci_out = os.path.join(OUTDIR, "opencodeinstruct_python_train.jsonl")
-    rows_oci = 0
-    with open(oci_out, "w", encoding="utf-8") as f:
-        for ex in oci_py:
-            rec = to_chat(ex.get("instruction"), ex.get("input"), ex.get("output"))
-            f.write(json.dumps(rec) + "\n")
-            rows_oci += 1
-    print(f"Saved {oci_out} ({rows_oci} conversations)")
-
-    # 2) Get more examples from CodeSearchNet
-    csn_train_split = f"train[:{CSN_PCT}%]"
-    csn_val_split   = f"validation[:{CSN_PCT}%]"
-    print(f"[Method 1] Getting {CSN_PCT}% of CodeSearchNet examples (keeping in memory)")
-    csn_tr = load_dataset(
-        "code_search_net", "python", split=csn_train_split,
-        cache_dir=ISOLATED_CACHE, keep_in_memory=True, download_mode="reuse_cache_if_exists",
-    )
-    csn_va = load_dataset(
-        "code_search_net", "python", split=csn_val_split,
-        cache_dir=ISOLATED_CACHE, keep_in_memory=True, download_mode="reuse_cache_if_exists",
-    )
-
-    def to_pair(ex):
-        """Turn code examples into question-answer pairs"""
-        doc  = (ex.get("func_documentation_string") or "").strip()  # The description
-        code = (ex.get("func_code_string") or "").strip()           # The code answer
-        if doc and code:
-            return to_chat("Write the Python function described by this docstring:", doc, code)
-        return None
-
-    csn_out = os.path.join(OUTDIR, "codesearchnet_python_train.jsonl")
-    rows_csn = 0
-    with open(csn_out, "w", encoding="utf-8") as f:
-        # Save training examples
-        for ex in csn_tr:
-            rec = to_pair(ex)
-            if rec:
-                f.write(json.dumps(rec) + "\n")
-                rows_csn += 1
-        # Save validation examples
-        for ex in csn_va:
-            rec = to_pair(ex)
-            if rec:
-                f.write(json.dumps(rec) + "\n")
-                rows_csn += 1
-    print(f"Saved {csn_out} ({rows_csn} conversations)")
-    print("All done with Method 1! You can get more data by increasing OCI_PCT/CSN_PCT.")
-
-# ---------------------- METHOD 2: STREAMING (like watching a video) ------------------------------------------
-
-def prepare_streaming() -> None:
-    """
-    Stream data with limits. Clean up first to avoid problems.
-    Like watching a movie online instead of downloading it.
-    """
-    from datasets import load_dataset
-
-    # Clean up first to avoid problems
-    delete_dataset_cache_like([
-        "nvidia___open_code_instruct",
-        "open_code_instruct",              # different name styles
-        "code_search_net",
-        "codesearchnet",
-    ])
-
-    # 1) Stream OpenCodeInstruct examples
-    print("[Method 2] Streaming OpenCodeInstruct Python examples…")
-    rows_oci = 0
-    oci_out = os.path.join(OUTDIR, "opencodeinstruct_python_train.jsonl")
-    try:
-        oci_stream = load_dataset("nvidia/OpenCodeInstruct", split="train", streaming=True)
-    except NotImplementedError:
-        print("[warn] Streaming not working for OpenCodeInstruct; skipping this one.")
-        oci_stream = None
-
-    if oci_stream is not None:
-        with open(oci_out, "w", encoding="utf-8") as f:
-            for ex in oci_stream:
-                if not is_python_lang(ex):
+                    print(f"  [warning] Failed to process task_id={task_id}: {e}")
+                    skipped += 1
                     continue
-                rec = to_chat(ex.get("instruction"), ex.get("input"), ex.get("output"))
-                f.write(json.dumps(rec) + "\n")
-                rows_oci += 1
-                # Stop when we have enough
-                if rows_oci >= OCI_MAX:
-                    break
-        print(f"Saved {oci_out} ({rows_oci} conversations)")
-    else:
-        print("[info] No OpenCodeInstruct data saved.")
+        
+        total_examples += rows_written
+        
+        print(f"  ✓ Saved {output_path}")
+        print(f"    - Written: {rows_written} examples")
+        if skipped > 0:
+            print(f"    - Skipped: {skipped} examples (missing fields)")
+    
+    # Summary
+    print("\n" + "="*70)
+    print("MBPP Dataset Preparation Complete!")
+    print("="*70)
+    print(f"\nTotal examples prepared: {total_examples}")
+    print(f"\nOutput files in '{OUTDIR}/':")
+    
+    for _, filename, display_name in splits_to_process:
+        filepath = os.path.join(OUTDIR, filename)
+        if os.path.exists(filepath):
+            size_kb = os.path.getsize(filepath) / 1024
+            # Count lines
+            with open(filepath, 'r') as f:
+                line_count = sum(1 for _ in f)
+            print(f"  • {filename:25s} - {line_count:4d} examples ({size_kb:7.1f} KB)")
+    
+    print("\n" + "="*70)
+    print("Next steps:")
+    print("  1. Train with: python -m src.train_kd --bf16 True --seq_len 2048")
+    print("  2. Evaluate with: python src/eval_codebleu_hub.py ...")
+    print("="*70 + "\n")
 
-    # 2) Stream CodeSearchNet examples
-    print("[Method 2] Streaming CodeSearchNet Python examples…")
-    rows_csn = 0
-    csn_out = os.path.join(OUTDIR, "codesearchnet_python_train.jsonl")
 
-    try:
-        csn_tr = load_dataset("code_search_net", "python", split="train", streaming=True)
-        csn_va = load_dataset("code_search_net", "python", split="validation", streaming=True)
-    except NotImplementedError:
-        print("[warn] Streaming not working for CodeSearchNet. Try Method 1 by installing pyarrow.")
-        csn_tr = csn_va = None
+def verify_data_files() -> bool:
+    """
+    Verify that all required data files exist and are not empty.
+    
+    Returns:
+        True if all files are present and valid, False otherwise
+    """
+    required_files = [
+        "mbpp_train.jsonl",
+        "mbpp_val.jsonl", 
+        "mbpp_test.jsonl",
+    ]
+    
+    all_valid = True
+    
+    for filename in required_files:
+        filepath = os.path.join(OUTDIR, filename)
+        
+        if not os.path.exists(filepath):
+            print(f"✗ Missing: {filepath}")
+            all_valid = False
+        elif os.path.getsize(filepath) == 0:
+            print(f"✗ Empty: {filepath}")
+            all_valid = False
+        else:
+            # Count lines to verify content
+            with open(filepath, 'r') as f:
+                line_count = sum(1 for _ in f)
+            if line_count == 0:
+                print(f"✗ No data: {filepath}")
+                all_valid = False
+            else:
+                print(f"✓ Valid: {filepath} ({line_count} examples)")
+    
+    return all_valid
 
-    def csn_pairs(stream):
-        """Get question-answer pairs from the stream"""
-        for ex in stream:
-            doc = (ex.get("func_documentation_string") or "").strip()
-            code = (ex.get("func_code_string") or "").strip()
-            if doc and code:
-                yield to_chat("Write the Python function described by this docstring:", doc, code)
 
-    with open(csn_out, "w", encoding="utf-8") as f:
-        if csn_tr is not None:
-            # Take half from training data
-            for rec in itertools.islice(csn_pairs(csn_tr), CSN_MAX // 2):
-                f.write(json.dumps(rec) + "\n"); rows_csn += 1
-        if csn_va is not None:
-            # Take the rest from validation data
-            for rec in itertools.islice(csn_pairs(csn_va), CSN_MAX - rows_csn):
-                f.write(json.dumps(rec) + "\n"); rows_csn += 1
-    print(f"Saved {csn_out} ({rows_csn} conversations)")
-    print(" All done with Method 2!")
+def show_sample_data() -> None:
+    """
+    Display a sample from the training data to verify format.
+    """
+    train_file = os.path.join(OUTDIR, "mbpp_train.jsonl")
+    
+    if not os.path.exists(train_file):
+        print("No training file found to display sample")
+        return
+    
+    print("\n" + "="*70)
+    print("Sample Training Example")
+    print("="*70 + "\n")
+    
+    with open(train_file, 'r', encoding='utf-8') as f:
+        first_line = f.readline()
+        if first_line:
+            try:
+                sample = json.loads(first_line)
+                
+                print("Task ID:", sample.get("task_id", "N/A"))
+                print("\nMessages:")
+                for msg in sample.get("messages", []):
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "")
+                    print(f"\n[{role.upper()}]")
+                    # Truncate long content
+                    if len(content) > 300:
+                        print(content[:300] + "...")
+                    else:
+                        print(content)
+                
+            except json.JSONDecodeError:
+                print("Failed to parse sample JSON")
+    
+    print("\n" + "="*70 + "\n")
 
-# ---------------------- Starting Point ----------------------------------------------------
 
 def main():
-    # Try Method 1 first if we have the right tools
-    if has_pyarrow():
-        print("[choice] Using Method 1: Small pieces in memory")
-        try:
-            prepare_non_streaming()
+    """
+    Main entry point for MBPP data preparation.
+    """
+    print("\n" + "="*70)
+    print("MBPP Data Preparation Script")
+    print("="*70 + "\n")
+    
+    # Check if data already exists
+    if verify_data_files():
+        print("\n✓ All MBPP data files already exist and are valid!")
+        print("\nOptions:")
+        print("  1. Continue anyway (will re-download and overwrite)")
+        print("  2. Skip preparation")
+        
+        user_input = os.environ.get("FORCE_REDOWNLOAD", "").lower()
+        if user_input not in ["1", "yes", "true", "force"]:
+            print("\nSkipping data preparation (files already exist)")
+            print("To force re-download, set: export FORCE_REDOWNLOAD=1")
+            
+            # Show sample
+            show_sample_data()
             return
-        except NotImplementedError as e:
-            print(f"[warning] Method 1 didn't work: {e}\n"
-                  f"          Trying Method 2 instead…")
+        else:
+            print("\nForcing re-download...")
+    
+    # Prepare the data
+    try:
+        prepare_mbpp_data()
+        
+        # Verify after preparation
+        print("\n[Final] Verifying prepared data files...")
+        if verify_data_files():
+            print("\n✓✓✓ All data files verified successfully! ✓✓✓")
+            
+            # Show a sample
+            show_sample_data()
+        else:
+            print("\n✗ Some data files are invalid or missing")
+            print("Please check the error messages above and try again")
+            
+    except KeyboardInterrupt:
+        print("\n\n[interrupted] Data preparation cancelled by user")
+    except Exception as e:
+        print(f"\n✗ Data preparation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\nPlease check the error above and try again")
 
-    print("[choice] Using Method 2: Streaming with limits")
-    prepare_streaming()
 
 if __name__ == "__main__":
     main()
