@@ -14,7 +14,7 @@ models:
 
 training:
   seq_len: 4096
-  epochs: 2
+  epochs: 10
   per_device_batch_size: 1
   grad_accum: 16
   learning_rate: 2.0e-4
