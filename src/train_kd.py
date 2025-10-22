@@ -4,7 +4,7 @@ Knowledge Distillation (KD) for Llama-3.1-8B (student) taught by Llama-3.1-70B (
 with MBPP dataset, validation loss tracking, and agreement metrics.
 
 Features:
-  • Train on MBPP dataset
+  • Train on MBPP dataset (train + validation splits for training)
   • Track training AND validation loss
   • Compute agreement metrics (token accuracy, top-k agreement, KL divergence)
   • Multi-GPU safe with device_map="auto"
@@ -20,7 +20,7 @@ Usage:
   CUDA_VISIBLE_DEVICES=0,1,2,3 python -u -m src.train_kd \
     --bf16 True --teacher_4bit True --seq_len 2048
 
-  # Multi-GPU full precision (8 GPUs)
+  # Multi-GPU full precision (8 GPUs) - Full MBPP dataset
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -u -m src.train_kd \
     --bf16 True --lora True --seq_len 2048
 """
@@ -817,11 +817,23 @@ def main():
     print(f"✓ Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     # --------------------------
-    # Step 7: Load MBPP datasets
+    # Step 7: Load MBPP datasets (FULL DATASET)
     # --------------------------
     print("\n[6/7] Loading MBPP datasets...")
-    train_files = [os.path.join(P["data_dir"], "mbpp_train.jsonl")]
-    val_files = [os.path.join(P["data_dir"], "mbpp_val.jsonl")]
+    
+    # Use train + validation for training (163 total examples)
+    # Use test for validation during training (257 examples)
+    train_files = [
+        os.path.join(P["data_dir"], "mbpp_train.jsonl"),   # 120 examples
+        os.path.join(P["data_dir"], "mbpp_val.jsonl"),     # 43 examples
+    ]
+    val_files = [
+        os.path.join(P["data_dir"], "mbpp_test.jsonl")     # 257 examples
+    ]
+    
+    print("  Training on: mbpp_train + mbpp_val (163 examples)")
+    print("  Validating on: mbpp_test (257 examples)")
+    print("  Total MBPP examples: 420")
     
     # Verify files exist
     for f in train_files + val_files:
@@ -879,8 +891,13 @@ def main():
     print(f"✓ Epochs: {Tcfg['epochs']}")
     print(f"✓ Batch size: {Tcfg['per_device_batch_size']}")
     print(f"✓ Gradient accumulation: {Tcfg['grad_accum']}")
+    print(f"✓ Effective batch size: {Tcfg['per_device_batch_size'] * Tcfg['grad_accum'] * torch.cuda.device_count()}")
     print(f"✓ Learning rate: {Tcfg['learning_rate']}")
     print(f"✓ Eval every: {args_cli.eval_steps} steps")
+    
+    # Calculate training steps
+    total_steps = (len(train_ds) * Tcfg["epochs"]) // (Tcfg["per_device_batch_size"] * Tcfg["grad_accum"] * torch.cuda.device_count())
+    print(f"✓ Estimated total training steps: {total_steps}")
 
     # --------------------------
     # Step 9: Setup callbacks
@@ -953,8 +970,11 @@ def main():
     print(f"  Model: {save_dir}")
     print(f"  Metrics: {out_dir}/training_metrics.jsonl")
     print(f"  Final metrics: {final_metrics_path}")
+    print(f"\nDataset used:")
+    print(f"  Training: {len(train_ds)} examples (mbpp_train + mbpp_val)")
+    print(f"  Validation: {len(val_ds)} examples (mbpp_test)")
     print("\nNext steps:")
-    print("  1. Analyze metrics: python analyze_metrics.py")
+    print("  1. Analyze metrics: cat outputs/.../training_metrics.jsonl")
     print("  2. Evaluate on test set: python src/eval_codebleu_hub.py ...")
     print("="*70 + "\n")
 
