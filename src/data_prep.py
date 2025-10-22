@@ -76,7 +76,11 @@ def to_chat(prompt: str, code: str, test_cases: List[str]) -> Dict[str, Any]:
         user_content += "\n\nTest cases:\n"
         # Include up to 3 test cases for context
         for i, test_case in enumerate(test_cases[:3], 1):
-            user_content += f"{i}. assert {test_case}\n"
+            # Clean up test case (remove 'assert' if present)
+            tc = test_case.strip()
+            if not tc.startswith('assert'):
+                tc = f"assert {tc}"
+            user_content += f"{tc}\n"
     
     return {
         "messages": [
@@ -92,7 +96,7 @@ def prepare_mbpp_data() -> None:
     Download and prepare MBPP dataset in chat conversation format.
     
     MBPP has two variants:
-      - "sanitized": Cleaned version with ~974 examples (recommended)
+      - "sanitized": Cleaned version with ~420 examples (recommended)
       - "full": Original version with ~1000 examples
     
     We use "sanitized" by default as it has better quality.
@@ -119,6 +123,15 @@ def prepare_mbpp_data() -> None:
             download_mode="reuse_cache_if_exists",
         )
         print("✓ Dataset downloaded successfully")
+        
+        # Debug: Show what fields are available
+        if len(dataset["train"]) > 0:
+            print("\n[debug] Available fields in dataset:")
+            sample = dataset["train"][0]
+            for key in sample.keys():
+                print(f"  - {key}: {type(sample[key])}")
+            print()
+        
     except Exception as e:
         print(f"✗ Failed to download MBPP dataset: {e}")
         print("\nTroubleshooting:")
@@ -150,15 +163,44 @@ def prepare_mbpp_data() -> None:
         skipped = 0
         
         with open(output_path, "w", encoding="utf-8") as f:
-            for example in split_data:
-                # Extract fields from MBPP format
-                task_id = example.get("task_id", -1)
-                prompt = example.get("text", "").strip()
-                code = example.get("code", "").strip()
-                test_list = example.get("test_list", [])
+            for idx, example in enumerate(split_data):
+                # Debug first example to see actual field names
+                if idx == 0:
+                    print(f"  [debug] First example keys: {list(example.keys())}")
+                    print(f"  [debug] Sample data:")
+                    for k, v in example.items():
+                        val_str = str(v)[:100] if v else "None"
+                        print(f"    {k}: {val_str}")
+                
+                # Extract fields - MBPP uses different field names
+                # Common field names in MBPP: text, code, test_list, task_id
+                task_id = example.get("task_id", idx)
+                
+                # Try multiple possible field names for prompt
+                prompt = (example.get("text") or 
+                         example.get("prompt") or 
+                         example.get("description") or "").strip()
+                
+                # Try multiple possible field names for code
+                code = (example.get("code") or 
+                       example.get("solution") or 
+                       example.get("canonical_solution") or "").strip()
+                
+                # Try multiple possible field names for test cases
+                test_list = (example.get("test_list") or 
+                           example.get("test_cases") or 
+                           example.get("tests") or [])
                 
                 # Skip examples with missing critical fields
-                if not prompt or not code:
+                if not prompt:
+                    if idx == 0:
+                        print(f"  [debug] Skipping: no prompt found")
+                    skipped += 1
+                    continue
+                    
+                if not code:
+                    if idx == 0:
+                        print(f"  [debug] Skipping: no code found")
                     skipped += 1
                     continue
                 
@@ -167,7 +209,7 @@ def prepare_mbpp_data() -> None:
                     chat_record = to_chat(
                         prompt=prompt,
                         code=code,
-                        test_cases=test_list
+                        test_cases=test_list if isinstance(test_list, list) else []
                     )
                     
                     # Add metadata for tracking
