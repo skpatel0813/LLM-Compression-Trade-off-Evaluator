@@ -1,29 +1,25 @@
-# src/train_kid.py
-# =================================================================================================
-# Knowledge Distillation (KD) for Llama-3.1-8B (student) taught by Llama-3.1-70B (teacher)
-#
-# Key features:
-#   • Multi-GPU safe: device_map="auto", per-GPU memory caps, no-op device move
-#   • Optional teacher quantization (4-bit / 8-bit) to avoid OOM
-#   • LoRA adapters for parameter-efficient student training (toggleable)
-#   • BF16/FP16 precision controls
-#   • Robust collator returning dict (Trainer-compatible)
-#   • KD loss = alpha * KL(student||teacher_T) * T^2 + (1-alpha) * CE(student,gold)
-#   • Optional MLflow GPU/power logging via LiteMLflowCallback
-#
-# Example runs:
-#   # single GPU, BF16 if supported, LoRA on
-#   CUDA_VISIBLE_DEVICES=0 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kid --bf16 True
-#
-#   # multi-GPU sharding, teacher in 4-bit to save VRAM, LoRA off (full-param KD)
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 MAX_SAMPLES=2000 "$CONDA_PREFIX/bin/python" -u -m src.train_kid \
-#     --bf16 True --teacher_4bit True --lora False --seq_len 1024 --max_memory_frac 0.90
-#
-# Requirements:
-#   transformers>=4.44, accelerate>=0.33, peft
-#   bitsandbytes (only if using 4/8-bit)
-#   (optional) mlflow, pynvml + src/callbacks_mlflow.py for GPU/power logging
-# =================================================================================================
+# src/train_kd.py
+"""
+Knowledge Distillation (KD) for Llama-3.1-8B (student) taught by Llama-3.1-70B (teacher)
+with MBPP dataset, validation loss tracking, and agreement metrics.
+
+Features:
+  • Train on MBPP dataset
+  • Track training AND validation loss
+  • Compute agreement metrics (token accuracy, top-k agreement, KL divergence)
+  • Multi-GPU safe with device_map="auto"
+  • Optional teacher quantization (4-bit / 8-bit)
+  • LoRA adapters for efficient training
+  • BF16/FP16 precision controls
+
+Usage:
+  # Single GPU
+  CUDA_VISIBLE_DEVICES=0 python -u -m src.train_kd --bf16 True --seq_len 2048
+
+  # Multi-GPU with quantized teacher
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python -u -m src.train_kd \
+    --bf16 True --teacher_4bit True --seq_len 2048
+"""
 
 from __future__ import annotations
 import os
@@ -32,6 +28,7 @@ import random
 import warnings
 import argparse
 from typing import Dict, List, Optional, Any, Tuple
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -44,6 +41,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
 )
 
 # Optional bitsandbytes for 4/8-bit quantization
@@ -53,7 +51,7 @@ try:
 except Exception:
     _HAS_BNB = False
 
-# Optional MLflow GPU/power logging callback (safe if missing)
+# Optional MLflow GPU/power logging callback
 try:
     from .callbacks_mlflow import LiteMLflowCallback
     _HAS_MLFLOW_CB = True
@@ -74,16 +72,16 @@ def set_seed(seed: int = 42) -> None:
 
 set_seed(42)
 
-# Modest speedup on Ampere+ (no-op elsewhere)
+# Modest speedup on Ampere+
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-# Reduce fragmentation on long runs
+# Reduce fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# Respect custom HF caches if provided
+# Respect custom HF caches
 for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
     v = os.environ.get(env_var)
     if v:
@@ -91,18 +89,19 @@ for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
 
 
 # -------------------------------------------------------------------------------------------------
-# Lightweight JSONL reader (O(1) memory with byte offsets)
+# Lightweight JSONL reader with train/val split
 # -------------------------------------------------------------------------------------------------
 class ChatJsonlReader(Dataset):
     """
-    Builds an index of (file_path, byte_offset). __getitem__ seeks and reads one JSON line.
-    Set MAX_SAMPLES (env or arg) to cap data volume when testing.
+    Reads JSONL files with byte offsets for memory efficiency.
+    Supports train and validation splits.
     """
     def __init__(self, files: List[str], max_samples: Optional[int] = None):
         self.index: List[Tuple[str, int]] = []
         total = 0
         for fp in files:
             if not os.path.isfile(fp):
+                print(f"[warning] File not found: {fp}")
                 continue
             with open(fp, "rb") as f:
                 offset = 0
@@ -117,6 +116,8 @@ class ChatJsonlReader(Dataset):
                         break
             if max_samples and total >= max_samples:
                 break
+        
+        print(f"[dataset] Loaded {len(self.index)} examples from {len(files)} files")
 
     def __len__(self) -> int:
         return len(self.index)
@@ -134,9 +135,8 @@ class ChatJsonlReader(Dataset):
 # -------------------------------------------------------------------------------------------------
 class CausalCollator:
     """
-    Converts list of {messages:[...]} into Llama-3 chat text, tokenizes, pads,
-    and produces labels (-100 on pad positions) for language modeling loss.
-    Returns a plain dict compatible with transformers.Trainer.
+    Converts {messages:[...]} into Llama-3 chat text, tokenizes, pads,
+    and produces labels for language modeling.
     """
     def __init__(self, tokenizer: PreTrainedTokenizerBase, max_seq_len: int):
         self.tok = tokenizer
@@ -157,23 +157,73 @@ class CausalCollator:
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100  # ignore pad on loss
 
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
 
 
 # -------------------------------------------------------------------------------------------------
-# KD helpers (next-token alignment)
+# KD helpers with agreement metrics
 # -------------------------------------------------------------------------------------------------
 def _shift_for_next_token(
     logits: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Align teacher/student token predictions with the next-token targets.
-    """
+    """Align predictions with next-token targets."""
     s_logits = logits[:, :-1, :]
     labels_shifted = labels[:, 1:]
     attn_shifted = attention_mask[:, 1:]
     valid = (attn_shifted > 0) & (labels_shifted != -100)
     return s_logits, labels_shifted, valid
+
+
+def compute_agreement_metrics(
+    s_logits: torch.Tensor,
+    t_logits: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> Dict[str, float]:
+    """
+    Compute agreement metrics between student and teacher:
+    - token_accuracy: % of tokens where student's top-1 matches teacher's top-1
+    - top5_agreement: % of tokens where student's top-1 is in teacher's top-5
+    - kl_divergence: KL divergence between distributions
+    """
+    s_next, gold, valid_mask = _shift_for_next_token(s_logits, labels, attention_mask)
+    t_next, _, _ = _shift_for_next_token(t_logits, labels, attention_mask)
+    
+    idx = valid_mask.view(-1)
+    if idx.sum().item() == 0:
+        return {
+            "token_accuracy": 0.0,
+            "top5_agreement": 0.0,
+            "kl_divergence": 0.0,
+        }
+    
+    s_sel = s_next.view(-1, s_next.size(-1))[idx]
+    t_sel = t_next.view(-1, t_next.size(-1))[idx]
+    
+    # Token accuracy: student top-1 matches teacher top-1
+    s_pred = s_sel.argmax(dim=-1)
+    t_pred = t_sel.argmax(dim=-1)
+    token_acc = (s_pred == t_pred).float().mean().item()
+    
+    # Top-5 agreement: student top-1 in teacher top-5
+    t_top5 = t_sel.topk(5, dim=-1).indices
+    s_pred_expanded = s_pred.unsqueeze(-1).expand_as(t_top5)
+    top5_agree = (s_pred_expanded == t_top5).any(dim=-1).float().mean().item()
+    
+    # KL divergence
+    log_p_s = F.log_softmax(s_sel, dim=-1)
+    p_t = F.softmax(t_sel, dim=-1)
+    kl = F.kl_div(log_p_s, p_t, reduction="batchmean").item()
+    
+    return {
+        "token_accuracy": token_acc,
+        "top5_agreement": top5_agree,
+        "kl_divergence": kl,
+    }
 
 
 def kd_loss(
@@ -186,14 +236,13 @@ def kd_loss(
 ) -> torch.Tensor:
     """
     Knowledge Distillation loss:
-      L = alpha * KL( student || teacher_T ) * T^2 + (1 - alpha) * CE(student, gold)
+      L = alpha * KL(student || teacher_T) * T^2 + (1-alpha) * CE(student, gold)
     """
     s_next, gold, valid_mask = _shift_for_next_token(s_logits, labels, attention_mask)
     t_next, _, _ = _shift_for_next_token(t_logits, labels, attention_mask)
 
     idx = valid_mask.view(-1)
     if idx.sum().item() == 0:
-        # No valid tokens in this small batch; return zero to keep training loop happy
         return torch.zeros([], device=s_logits.device, dtype=s_logits.dtype)
 
     s_sel = s_next.view(-1, s_next.size(-1))[idx]
@@ -214,17 +263,13 @@ def kd_loss(
 # Utilities
 # -------------------------------------------------------------------------------------------------
 def make_max_memory_map(frac: float = 0.90) -> Dict[int, str]:
-    """
-    Build a HuggingFace-compatible per-GPU max_memory dict using FRACTION of TOTAL memory.
-    Example return: {0: "70GiB", 1: "70GiB", ...}
-    """
+    """Build per-GPU max_memory dict using fraction of total memory."""
     max_mem = {}
     if not torch.cuda.is_available():
         return max_mem
     n = torch.cuda.device_count()
     for i in range(n):
-        # Use total*frac (safer than "free" which can be near-zero during loading)
-        total = torch.cuda.get_device_properties(i).total_memory  # bytes
+        total = torch.cuda.get_device_properties(i).total_memory
         cap = int(total * frac)
         cap_gib = max(1, cap // (1024 ** 3))
         max_mem[i] = f"{cap_gib}GiB"
@@ -238,12 +283,52 @@ def str2bool(x: Optional[str]) -> Optional[bool]:
 
 
 # -------------------------------------------------------------------------------------------------
-# Custom Trainer (no-op device move; teacher forward under no_grad; accepts **kwargs)
+# Metrics Logging Callback
+# -------------------------------------------------------------------------------------------------
+class MetricsCallback(TrainerCallback):
+    """
+    Callback to log and save training/validation metrics including agreement metrics.
+    """
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.metrics_file = os.path.join(output_dir, "training_metrics.jsonl")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Initialize metrics file
+        with open(self.metrics_file, "w") as f:
+            f.write("")  # Create empty file
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Called when logging occurs."""
+        if logs:
+            # Add step/epoch info
+            logs["step"] = state.global_step
+            logs["epoch"] = state.epoch
+            
+            # Write to file
+            with open(self.metrics_file, "a") as f:
+                f.write(json.dumps(logs) + "\n")
+            
+            # Print important metrics
+            if "loss" in logs:
+                print(f"Step {state.global_step}: train_loss={logs['loss']:.4f}")
+            if "eval_loss" in logs:
+                print(f"Step {state.global_step}: val_loss={logs['eval_loss']:.4f}")
+            if "eval_token_accuracy" in logs:
+                print(f"  → token_accuracy={logs['eval_token_accuracy']:.4f}, "
+                      f"top5_agreement={logs['eval_top5_agreement']:.4f}, "
+                      f"kl_div={logs['eval_kl_divergence']:.4f}")
+
+
+# -------------------------------------------------------------------------------------------------
+# Custom Trainer with validation and agreement metrics
 # -------------------------------------------------------------------------------------------------
 class KDTrainer(Trainer):
     """
-    - Prevents Trainer from relocating model (important for device_map="auto" sharded models)
-    - Computes KD loss by running teacher forward with no_grad
+    Custom trainer that:
+    - Prevents device relocation (for device_map="auto")
+    - Computes KD loss with teacher forward under no_grad
+    - Tracks agreement metrics during evaluation
     """
     def __init__(self, *args, teacher: nn.Module, T: float, alpha: float, **kwargs):
         super().__init__(*args, **kwargs)
@@ -253,59 +338,136 @@ class KDTrainer(Trainer):
         self.T = float(T)
         self.alpha = float(alpha)
 
-    # Avoid meta-tensor crash by not moving model away from HF/Accelerate placement
     def _move_model_to_device(self, model, device):
+        """Avoid moving model (important for device_map='auto')."""
         return model
 
-    # Newer HF may pass extra kwargs (e.g., num_items_in_batch); accept **kwargs
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
+        """Compute KD loss during training."""
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         labels = inputs["labels"]
 
+        # Student forward
         s_out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
+        # Teacher forward (no grad)
         with torch.no_grad():
             t_out = self.teacher(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
+        # Compute KD loss
         loss = kd_loss(
             s_out.logits, t_out.logits, labels, attention_mask,
             T=self.T, alpha=self.alpha
         )
+        
         return (loss, s_out) if return_outputs else loss
+
+    def evaluation_loop(self, dataloader, description, prediction_loss_only=None, 
+                       ignore_keys=None, metric_key_prefix="eval"):
+        """
+        Override evaluation loop to compute agreement metrics.
+        """
+        model = self.model
+        model.eval()
+        
+        all_losses = []
+        all_agreement_metrics = defaultdict(list)
+        
+        print(f"\n[evaluation] Running {description}...")
+        
+        for step, inputs in enumerate(dataloader):
+            # Move inputs to device
+            inputs = self._prepare_inputs(inputs)
+            
+            with torch.no_grad():
+                # Student forward
+                s_out = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False
+                )
+                
+                # Teacher forward
+                t_out = self.teacher(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False
+                )
+                
+                # Compute loss
+                loss = kd_loss(
+                    s_out.logits, t_out.logits,
+                    inputs["labels"], inputs["attention_mask"],
+                    T=self.T, alpha=self.alpha
+                )
+                all_losses.append(loss.item())
+                
+                # Compute agreement metrics
+                metrics = compute_agreement_metrics(
+                    s_out.logits, t_out.logits,
+                    inputs["labels"], inputs["attention_mask"]
+                )
+                for k, v in metrics.items():
+                    all_agreement_metrics[k].append(v)
+            
+            # Progress
+            if step % 10 == 0:
+                print(f"  Eval step {step}/{len(dataloader)}")
+        
+        # Aggregate metrics
+        avg_loss = sum(all_losses) / len(all_losses) if all_losses else 0.0
+        
+        result = {
+            f"{metric_key_prefix}_loss": avg_loss,
+        }
+        
+        for k, v_list in all_agreement_metrics.items():
+            result[f"{metric_key_prefix}_{k}"] = sum(v_list) / len(v_list) if v_list else 0.0
+        
+        print(f"[evaluation] {description} complete:")
+        print(f"  Loss: {avg_loss:.4f}")
+        print(f"  Token Accuracy: {result.get(f'{metric_key_prefix}_token_accuracy', 0):.4f}")
+        print(f"  Top-5 Agreement: {result.get(f'{metric_key_prefix}_top5_agreement', 0):.4f}")
+        print(f"  KL Divergence: {result.get(f'{metric_key_prefix}_kl_divergence', 0):.4f}")
+        
+        return result
 
 
 # -------------------------------------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser(description="Train student with KD from teacher (Llama3.1)")
+    ap = argparse.ArgumentParser(description="Train student with KD on MBPP")
 
     # Precision
     ap.add_argument("--bf16", type=str, default=None,
-                    help="True/False to force bfloat16; default: auto if supported.")
+                    help="True/False for bfloat16; default: auto")
     ap.add_argument("--fp16", type=str, default=None,
-                    help="True/False to force float16; default: opposite of bf16 when CUDA.")
+                    help="True/False for float16; default: opposite of bf16")
 
-    # Sequence length override
-    ap.add_argument("--seq_len", type=int, default=None, help="Override seq_len from config.")
+    # Sequence length
+    ap.add_argument("--seq_len", type=int, default=None,
+                    help="Override seq_len from config")
 
     # Memory & quantization
-    ap.add_argument("--max_memory_frac", type=float, default=float(os.environ.get("MAX_MEMORY_FRAC", 0.90)),
-                    help="Per-GPU total memory fraction cap for model loading (default 0.90).")
+    ap.add_argument("--max_memory_frac", type=float, default=0.90,
+                    help="Per-GPU memory fraction cap (default 0.90)")
     ap.add_argument("--teacher_4bit", type=str, default="False",
-                    help="Quantize teacher in 4-bit (requires bitsandbytes).")
+                    help="Quantize teacher in 4-bit")
     ap.add_argument("--teacher_8bit", type=str, default="False",
-                    help="Quantize teacher in 8-bit (requires bitsandbytes).")
+                    help="Quantize teacher in 8-bit")
 
     # LoRA toggle
     ap.add_argument("--lora", type=str, default="True",
-                    help="Use LoRA adapters for student (True/False). If False = full-parameter KD.")
+                    help="Use LoRA adapters (True/False)")
 
-    # Logging & callbacks
-    ap.add_argument("--logging_steps", type=int, default=int(os.environ.get("LOGGING_STEPS", "20")))
+    # Logging
+    ap.add_argument("--logging_steps", type=int, default=20)
+    ap.add_argument("--eval_steps", type=int, default=100,
+                    help="Run evaluation every N steps")
     ap.add_argument("--use_mlflow_cb", type=str, default="True",
-                    help="Attach MLflow GPU/power callback if available (True/False).")
+                    help="Use MLflow callback if available")
 
     return ap.parse_args()
 
@@ -316,7 +478,7 @@ def parse_args():
 def main():
     args_cli = parse_args()
 
-    # Load project config
+    # Load config
     cfg = Config.load().cfg
     P = cfg["paths"]
     M = cfg["models"]
@@ -326,20 +488,24 @@ def main():
         Tcfg["seq_len"] = int(args_cli.seq_len)
 
     os.makedirs(P["outputs_dir"], exist_ok=True)
-    os.makedirs(P["lora_dir"], exist_ok=True)
 
-    MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "0"))  # 0 => all samples
+    print("\n" + "="*70)
+    print("Knowledge Distillation Training on MBPP")
+    print("="*70)
 
-    # -------------------------
+    # --------------------------
     # Tokenizer
-    # -------------------------
+    # --------------------------
+    print("\n[1/7] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(M["student_id"], use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    print(f"✓ Tokenizer loaded: {M['student_id']}")
 
-    # -------------------------
+    # --------------------------
     # Precision selection
-    # -------------------------
+    # --------------------------
+    print("\n[2/7] Configuring precision...")
     if torch.cuda.is_available():
         auto_bf16 = torch.cuda.is_bf16_supported()
         force_bf16 = str2bool(args_cli.bf16)
@@ -363,17 +529,21 @@ def main():
         use_bf16, use_fp16 = False, False
 
     dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
+    print(f"✓ Precision: {dtype}")
 
-    # -------------------------
-    # Per-GPU max_memory caps for safe sharding
-    # -------------------------
+    # --------------------------
+    # Memory caps
+    # --------------------------
     max_memory = make_max_memory_map(frac=float(args_cli.max_memory_frac)) if torch.cuda.is_available() else None
+    if max_memory:
+        print(f"✓ Max memory per GPU: {list(max_memory.values())[0]}")
 
-    # -------------------------
-    # Teacher loader kwargs (with optional quantization)
-    # -------------------------
+    # --------------------------
+    # Teacher kwargs
+    # --------------------------
+    print("\n[3/7] Loading teacher model (70B)...")
     teacher_kwargs = dict(
-        dtype=dtype,                     # use dtype unless quantized
+        dtype=dtype,
         device_map="auto",
         low_cpu_mem_usage=True,
         max_memory=max_memory,
@@ -383,10 +553,7 @@ def main():
     teacher_8bit = str2bool(args_cli.teacher_8bit)
 
     if (teacher_4bit or teacher_8bit) and not _HAS_BNB:
-        raise RuntimeError(
-            "Requested teacher 4/8-bit quantization but bitsandbytes is not installed. "
-            "Install it (pip install bitsandbytes) or disable the flags."
-        )
+        raise RuntimeError("Quantization requested but bitsandbytes not installed")
 
     if teacher_4bit:
         teacher_kwargs.pop("dtype", None)
@@ -396,17 +563,20 @@ def main():
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16 if dtype == torch.bfloat16 else torch.float16,
         )
+        print("✓ Using 4-bit quantization for teacher")
     elif teacher_8bit:
         teacher_kwargs.pop("dtype", None)
         teacher_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        print("✓ Using 8-bit quantization for teacher")
 
-    # -------------------------
-    # Load TEACHER (70B) & STUDENT (8B)
-    # -------------------------
-    print("Loading the WISE TEACHER:", M["teacher_id"])
+    # Load teacher
     teacher = AutoModelForCausalLM.from_pretrained(M["teacher_id"], **teacher_kwargs)
+    print(f"✓ Teacher loaded: {M['teacher_id']}")
 
-    print("Loading the SMART STUDENT:", M["student_id"])
+    # --------------------------
+    # Student
+    # --------------------------
+    print("\n[4/7] Loading student model (8B)...")
     student = AutoModelForCausalLM.from_pretrained(
         M["student_id"],
         dtype=dtype,
@@ -415,115 +585,169 @@ def main():
         max_memory=max_memory,
     )
 
-    # Reduce activation memory
     if hasattr(student, "gradient_checkpointing_enable"):
         student.gradient_checkpointing_enable()
+    print(f"✓ Student loaded: {M['student_id']}")
 
-    # -------------------------
-    # LoRA (optional)
-    # -------------------------
+    # --------------------------
+    # LoRA
+    # --------------------------
     use_lora = str2bool(args_cli.lora) if args_cli.lora is not None else True
     if use_lora:
+        print("\n[5/7] Applying LoRA adapters...")
         from peft import LoraConfig, get_peft_model, TaskType
         lcfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=16,
             lora_alpha=32,
             lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", 
+                          "gate_proj", "up_proj", "down_proj"],
             bias="none",
         )
         student = get_peft_model(student, lcfg)
+        print("✓ LoRA applied")
     else:
-        print("LoRA disabled → full-parameter KD fine-tune. Expect much higher VRAM usage.")
+        print("\n[5/7] Full-parameter training (no LoRA)")
 
-    # Info: trainable vs total params
-    trainable, total = 0, 0
-    for p in student.parameters():
-        n = p.numel()
-        total += n
-        if p.requires_grad:
-            trainable += n
-    print(f"Teaching only: {trainable:,} parts out of {total:,} total "
-          f"({100 * trainable / total:.2f}%) - that's efficient!")
+    # Trainable params
+    trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in student.parameters())
+    print(f"✓ Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
-    # -------------------------
-    # Dataset & collator
-    # -------------------------
-    data_files = [
-        os.path.join(P["data_dir"], "opencodeinstruct_python_train.jsonl"),
-        os.path.join(P["data_dir"], "codesearchnet_python_train.jsonl"),
-    ]
-    data_files = [fp for fp in data_files if os.path.isfile(fp) and os.path.getsize(fp) > 0]
-
-    ds = ChatJsonlReader(
-        data_files,
-        max_samples=(MAX_SAMPLES if MAX_SAMPLES > 0 else None),
-    )
-    if len(ds) == 0:
-        raise FileNotFoundError("No training JSONL found. Run: python -m src.data_prep")
-
+    # --------------------------
+    # Datasets (MBPP)
+    # --------------------------
+    print("\n[6/7] Loading MBPP datasets...")
+    train_files = [os.path.join(P["data_dir"], "mbpp_train.jsonl")]
+    val_files = [os.path.join(P["data_dir"], "mbpp_val.jsonl")]
+    
+    # Verify files exist
+    for f in train_files + val_files:
+        if not os.path.exists(f):
+            raise FileNotFoundError(
+                f"Missing {f}\n"
+                f"Run: python -m src.data_prep"
+            )
+    
+    train_ds = ChatJsonlReader(train_files)
+    val_ds = ChatJsonlReader(val_files)
+    
+    print(f"✓ Train: {len(train_ds)} examples")
+    print(f"✓ Val: {len(val_ds)} examples")
+    
     collator = CausalCollator(tokenizer, max_seq_len=Tcfg["seq_len"])
 
-    # -------------------------
+    # --------------------------
     # TrainingArguments
-    # -------------------------
-    out_dir = os.path.join(P["outputs_dir"], "llama31_8b_kd_lora" if use_lora else "llama31_8b_kd_full")
+    # --------------------------
+    print("\n[7/7] Configuring training...")
+    out_dir = os.path.join(P["outputs_dir"], 
+                          "llama31_8b_mbpp_kd_lora" if use_lora else "llama31_8b_mbpp_kd_full")
+    
     targs = TrainingArguments(
         output_dir=out_dir,
         num_train_epochs=Tcfg["epochs"],
         per_device_train_batch_size=Tcfg["per_device_batch_size"],
+        per_device_eval_batch_size=Tcfg["per_device_batch_size"],
         gradient_accumulation_steps=Tcfg["grad_accum"],
         learning_rate=Tcfg["learning_rate"],
         warmup_ratio=0.03,
         logging_steps=int(args_cli.logging_steps),
+        eval_strategy="steps",
+        eval_steps=int(args_cli.eval_steps),
         save_steps=500,
         save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
         bf16=(dtype == torch.bfloat16),
         fp16=(dtype == torch.float16),
         gradient_checkpointing=True,
         optim="adamw_torch",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
-        report_to=[],                # no external logging integrations by default
+        report_to=[],
         dataloader_num_workers=2,
         ddp_find_unused_parameters=False,
-        remove_unused_columns=False, # safer for custom collators/LMs
+        remove_unused_columns=False,
     )
 
-    # -------------------------
-    # Trainer (attach MLflow callback if available & requested)
-    # -------------------------
-    callbacks = []
+    print(f"✓ Output directory: {out_dir}")
+    print(f"✓ Epochs: {Tcfg['epochs']}")
+    print(f"✓ Batch size: {Tcfg['per_device_batch_size']}")
+    print(f"✓ Gradient accumulation: {Tcfg['grad_accum']}")
+    print(f"✓ Learning rate: {Tcfg['learning_rate']}")
+    print(f"✓ Eval every: {args_cli.eval_steps} steps")
+
+    # --------------------------
+    # Callbacks
+    # --------------------------
+    callbacks = [MetricsCallback(out_dir)]
+    
     use_cb = str2bool(args_cli.use_mlflow_cb) if args_cli.use_mlflow_cb is not None else True
     if use_cb and _HAS_MLFLOW_CB:
         callbacks.append(LiteMLflowCallback(log_gpu_every_n_steps=int(args_cli.logging_steps)))
 
+    # --------------------------
+    # Trainer
+    # --------------------------
+    print("\n" + "="*70)
+    print("Starting Knowledge Distillation Training")
+    print("="*70 + "\n")
+    
     trainer = KDTrainer(
         model=student,
         args=targs,
-        train_dataset=ds,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
         data_collator=collator,
-        tokenizer=tokenizer,  # deprecation warning okay; HF keeps backwards compat
+        tokenizer=tokenizer,
         teacher=teacher,
         T=float(Tcfg.get("kd_temp", 1.0)),
         alpha=float(Tcfg.get("kd_alpha", 0.5)),
         callbacks=callbacks,
     )
 
-    # -------------------------
+    # --------------------------
     # Train
-    # -------------------------
+    # --------------------------
     trainer.train()
 
-    # -------------------------
-    # Save (LoRA adapters OR full model) + tokenizer
-    # -------------------------
+    # --------------------------
+    # Final evaluation
+    # --------------------------
+    print("\n" + "="*70)
+    print("Running Final Evaluation")
+    print("="*70 + "\n")
+    
+    final_metrics = trainer.evaluate()
+    
+    print("\nFinal Validation Metrics:")
+    print(f"  Loss: {final_metrics['eval_loss']:.4f}")
+    print(f"  Token Accuracy: {final_metrics['eval_token_accuracy']:.4f}")
+    print(f"  Top-5 Agreement: {final_metrics['eval_top5_agreement']:.4f}")
+    print(f"  KL Divergence: {final_metrics['eval_kl_divergence']:.4f}")
+    
+    # Save final metrics
+    final_metrics_path = os.path.join(out_dir, "final_metrics.json")
+    with open(final_metrics_path, "w") as f:
+        json.dump(final_metrics, f, indent=2)
+    print(f"\n✓ Final metrics saved: {final_metrics_path}")
+
+    # --------------------------
+    # Save model
+    # --------------------------
     save_dir = P["lora_dir"] if use_lora else out_dir
-    print("Saving the student's knowledge to:", save_dir)
+    print(f"\n✓ Saving model to: {save_dir}")
     student.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
-    print("✅ Distillation complete.")
+    
+    print("\n" + "="*70)
+    print("✅ Knowledge Distillation Complete!")
+    print("="*70)
+    print(f"\nModel saved to: {save_dir}")
+    print(f"Metrics saved to: {out_dir}/training_metrics.jsonl")
+    print(f"Final metrics: {final_metrics_path}")
 
 
 if __name__ == "__main__":
