@@ -88,36 +88,43 @@ def extract_code(text: str) -> str:
     return '\n'.join(code_lines).strip()
 
 
+def extract_test_cases(messages: list) -> list:
+    """Extract test cases from messages."""
+    test_cases = []
+    
+    for msg in messages:
+        if msg["role"] == "user":
+            content = msg["content"]
+            # Look for lines starting with assert
+            for line in content.split('\n'):
+                line = line.strip()
+                if line.startswith('assert '):
+                    test_cases.append(line)
+    
+    return test_cases
+
+
 def test_code(code: str, test_cases: list, timeout: int = 5) -> tuple:
     """
-    Execute code with test cases and return (passed, total, error).
+    Execute code with test cases and return (passed, total, errors).
     
     Returns:
-        (num_passed, num_total, error_message)
+        (num_passed, num_total, list_of_errors)
     """
     if not code or not test_cases:
-        return 0, 0, "No code or tests"
+        return 0, 0, ["No code or tests"]
     
-    # Create test script
-    test_script = code + "\n\n"
-    
-    # Add test cases
     passed = 0
-    total = 0
+    total = len(test_cases)
+    errors = []
     
-    for test in test_cases:
+    for i, test in enumerate(test_cases):
         test = test.strip()
         if not test:
             continue
         
-        # Ensure it's an assert statement
-        if not test.startswith('assert'):
-            test = f"assert {test}"
-        
-        total += 1
-        
-        # Try to execute this specific test
-        full_script = test_script + test + "\n"
+        # Create full test script
+        full_script = code + "\n\n" + test + "\n"
         
         try:
             # Execute in isolated environment
@@ -135,15 +142,18 @@ def test_code(code: str, test_cases: list, timeout: int = 5) -> tuple:
                 
                 if result.returncode == 0:
                     passed += 1
+                else:
+                    errors.append(f"Test {i+1}: {result.stderr[:100]}")
             finally:
-                os.unlink(temp_file)
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
                 
         except subprocess.TimeoutExpired:
-            continue
-        except Exception:
-            continue
+            errors.append(f"Test {i+1}: Timeout")
+        except Exception as e:
+            errors.append(f"Test {i+1}: {str(e)[:100]}")
     
-    return passed, total, None
+    return passed, total, errors
 
 
 def evaluate(model, tokenizer, test_file, args):
@@ -168,15 +178,8 @@ def evaluate(model, tokenizer, test_file, args):
         prompt_messages = messages[:-1]
         reference_code = messages[-1]["content"]
         
-        # Extract test cases if available
-        test_cases = []
-        for msg in messages:
-            if msg["role"] == "user":
-                content = msg["content"]
-                # Look for test cases in user message
-                import re
-                test_matches = re.findall(r'assert\s+.*', content)
-                test_cases.extend(test_matches)
+        # Extract test cases
+        test_cases = extract_test_cases(messages)
         
         # Generate prediction
         formatted = tokenizer.apply_chat_template(
@@ -205,11 +208,11 @@ def evaluate(model, tokenizer, test_file, args):
         
         # Test the code
         if test_cases:
-            passed, total_tests, error = test_code(prediction_code, test_cases)
+            passed, total_tests, errors = test_code(prediction_code, test_cases)
             is_correct = (passed == total_tests and total_tests > 0)
         else:
-            # No tests available - can't determine correctness
-            passed, total_tests, error = 0, 0, "No tests"
+            # No tests available
+            passed, total_tests, errors = 0, 0, ["No tests"]
             is_correct = False
         
         if is_correct:
