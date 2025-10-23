@@ -1,16 +1,17 @@
 # src/train_kd.py
 """
 Knowledge Distillation (KD) for Llama-3.1-8B (student) taught by Llama-3.1-70B (teacher)
-with MBPP dataset, validation loss tracking, and agreement metrics.
+with CodeAlpaca dataset, validation loss tracking, and agreement metrics.
 
 Features:
-  • Train on MBPP dataset (train + validation splits for training)
+  • Train on CodeAlpaca-20k dataset (~20k Python code examples)
   • Track training AND validation loss
   • Compute agreement metrics (token accuracy, top-k agreement, KL divergence)
   • Multi-GPU safe with device_map="auto"
   • Optional teacher quantization (4-bit / 8-bit)
   • LoRA adapters for efficient training
   • BF16/FP16 precision controls
+  • Compatible with HumanEval evaluation (no changes needed)
 
 Usage:
   # Single GPU
@@ -20,7 +21,7 @@ Usage:
   CUDA_VISIBLE_DEVICES=0,1,2,3 python -u -m src.train_kd \
     --bf16 True --teacher_4bit True --seq_len 2048
 
-  # Multi-GPU full precision (8 GPUs) - Full MBPP dataset
+  # Multi-GPU full precision (8 GPUs) - Full CodeAlpaca dataset
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -u -m src.train_kd \
     --bf16 True --lora True --seq_len 2048
 """
@@ -100,7 +101,7 @@ for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
 class ChatJsonlReader(Dataset):
     """
     Memory-efficient JSONL dataset reader using byte offsets.
-    Supports training and validation splits from MBPP data.
+    Supports training and validation splits from CodeAlpaca data.
     
     Each record should have a 'messages' field containing chat-formatted conversations.
     """
@@ -602,7 +603,7 @@ class KDTrainer(Trainer):
 def parse_args():
     """Parse command-line arguments for training configuration."""
     ap = argparse.ArgumentParser(
-        description="Train student model with Knowledge Distillation on MBPP dataset"
+        description="Train student model with Knowledge Distillation on CodeAlpaca dataset"
     )
 
     # Precision options
@@ -679,7 +680,7 @@ def main():
     os.makedirs(P["outputs_dir"], exist_ok=True)
 
     print("\n" + "="*70)
-    print("Knowledge Distillation Training on MBPP")
+    print("Knowledge Distillation Training on CodeAlpaca")
     print("="*70)
 
     # --------------------------
@@ -817,23 +818,23 @@ def main():
     print(f"✓ Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     # --------------------------
-    # Step 7: Load MBPP datasets (FULL DATASET)
+    # Step 7: Load CodeAlpaca datasets
     # --------------------------
-    print("\n[6/7] Loading MBPP datasets...")
+    print("\n[6/7] Loading CodeAlpaca datasets...")
     
-    # Use train + validation for training (163 total examples)
-    # Use test for validation during training (257 examples)
+    # Use train for training (~16,000 examples)
+    # Use validation for validation during training (~2,000 examples)
+    # Test split reserved for final evaluation (~2,000 examples)
     train_files = [
-        os.path.join(P["data_dir"], "mbpp_train.jsonl"),   # 120 examples
-        os.path.join(P["data_dir"], "mbpp_val.jsonl"),     # 43 examples
+        os.path.join(P["data_dir"], "codealpaca_train.jsonl"),   # ~16,000 examples
     ]
     val_files = [
-        os.path.join(P["data_dir"], "mbpp_test.jsonl")     # 257 examples
+        os.path.join(P["data_dir"], "codealpaca_val.jsonl")     # ~2,000 examples
     ]
     
-    print("  Training on: mbpp_train + mbpp_val (163 examples)")
-    print("  Validating on: mbpp_test (257 examples)")
-    print("  Total MBPP examples: 420")
+    print("  Training on: codealpaca_train (~16,000 examples)")
+    print("  Validating on: codealpaca_val (~2,000 examples)")
+    print("  Test split reserved for final evaluation")
     
     # Verify files exist
     for f in train_files + val_files:
@@ -857,7 +858,7 @@ def main():
     print("\n[7/7] Configuring training...")
     out_dir = os.path.join(
         P["outputs_dir"], 
-        "llama31_8b_mbpp_kd_lora" if use_lora else "llama31_8b_mbpp_kd_full"
+        "llama31_8b_codealpaca_kd_lora" if use_lora else "llama31_8b_codealpaca_kd_full"
     )
     
     targs = TrainingArguments(
@@ -971,11 +972,12 @@ def main():
     print(f"  Metrics: {out_dir}/training_metrics.jsonl")
     print(f"  Final metrics: {final_metrics_path}")
     print(f"\nDataset used:")
-    print(f"  Training: {len(train_ds)} examples (mbpp_train + mbpp_val)")
-    print(f"  Validation: {len(val_ds)} examples (mbpp_test)")
+    print(f"  Training: {len(train_ds)} examples (codealpaca_train)")
+    print(f"  Validation: {len(val_ds)} examples (codealpaca_val)")
     print("\nNext steps:")
     print("  1. Analyze metrics: cat outputs/.../training_metrics.jsonl")
-    print("  2. Evaluate on test set: python src/eval_codebleu_hub.py ...")
+    print("  2. Evaluate on HumanEval (no changes needed to evaluation pipeline)")
+    print("  3. Optional: Test on CodeAlpaca test split")
     print("="*70 + "\n")
 
 
