@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 evaluate_combined.py - Evaluate a model on combined test set
-
-This evaluates on the 10% test split from combined MBPP+HumanEval dataset
 """
 
 import json
 import torch
+import re
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import sys
@@ -58,7 +57,6 @@ def load_model(args):
 
 def normalize_code(code: str) -> str:
     """Normalize code for comparison."""
-    import re
     # Remove comments
     code = re.sub(r'#.*$', '', code, flags=re.MULTILINE)
     # Remove docstrings
@@ -77,11 +75,11 @@ def code_similarity(pred: str, ref: str) -> float:
     if not pred_norm or not ref_norm:
         return 0.0
     
-    # Check if they're identical after normalization
+    # Check if identical after normalization
     if pred_norm == ref_norm:
         return 1.0
     
-    # Use token overlap
+    # Use token overlap (Jaccard similarity)
     pred_tokens = set(pred_norm.split())
     ref_tokens = set(ref_norm.split())
     
@@ -109,7 +107,7 @@ def evaluate(model, tokenizer, test_file, args):
     for example in tqdm(test_data, desc="Evaluating"):
         # Extract prompt and reference
         messages = example["messages"]
-        prompt_messages = messages[:-1]  # All but last (assistant) message
+        prompt_messages = messages[:-1]
         reference = messages[-1]["content"]
         
         # Format prompt
@@ -151,7 +149,7 @@ def evaluate(model, tokenizer, test_file, args):
     # Calculate metrics
     avg_similarity = sum(similarities) / len(similarities) if similarities else 0
     
-    # Calculate per-source metrics
+    # Per-source metrics
     humaneval_sims = [r["similarity"] for r in results if r.get("source") == "humaneval"]
     mbpp_sims = [r["similarity"] for r in results if r.get("source") == "mbpp"]
     
@@ -195,9 +193,9 @@ def main():
     print("\n" + "="*70)
     print("RESULTS")
     print("="*70)
-    print(f"Overall Accuracy: {metrics['overall_accuracy']:.4f} ({metrics['overall_accuracy']*100:.2f}%)")
-    print(f"HumanEval:        {metrics['humaneval_accuracy']:.4f} ({metrics['humaneval_count']})")
-    print(f"MBPP:             {metrics['mbpp_accuracy']:.4f} ({metrics['mbpp_count']})")
+    print(f"Overall Similarity: {metrics['overall_similarity']:.4f} ({metrics['overall_similarity']*100:.2f}%)")
+    print(f"HumanEval:          {metrics['humaneval_similarity']:.4f} ({metrics['humaneval_count']} examples)")
+    print(f"MBPP:               {metrics['mbpp_similarity']:.4f} ({metrics['mbpp_count']} examples)")
     print("="*70)
     print(f"\nResults: {output_path}")
     print(f"Metrics: {metrics_path}")
