@@ -56,6 +56,44 @@ def load_model(args):
     return model, tokenizer
 
 
+def normalize_code(code: str) -> str:
+    """Normalize code for comparison."""
+    import re
+    # Remove comments
+    code = re.sub(r'#.*$', '', code, flags=re.MULTILINE)
+    # Remove docstrings
+    code = re.sub(r'""".*?"""', '', code, flags=re.DOTALL)
+    code = re.sub(r"'''.*?'''", '', code, flags=re.DOTALL)
+    # Remove extra whitespace
+    lines = [line.strip() for line in code.split('\n') if line.strip()]
+    return '\n'.join(lines)
+
+
+def code_similarity(pred: str, ref: str) -> float:
+    """Compute simple code similarity (0-1)."""
+    pred_norm = normalize_code(pred)
+    ref_norm = normalize_code(ref)
+    
+    if not pred_norm or not ref_norm:
+        return 0.0
+    
+    # Check if they're identical after normalization
+    if pred_norm == ref_norm:
+        return 1.0
+    
+    # Use token overlap
+    pred_tokens = set(pred_norm.split())
+    ref_tokens = set(ref_norm.split())
+    
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    
+    intersection = len(pred_tokens & ref_tokens)
+    union = len(pred_tokens | ref_tokens)
+    
+    return intersection / union if union > 0 else 0.0
+
+
 def evaluate(model, tokenizer, test_file, args):
     """Run evaluation."""
     # Load test data
@@ -66,8 +104,7 @@ def evaluate(model, tokenizer, test_file, args):
     
     # Generate predictions
     results = []
-    correct = 0
-    total = 0
+    similarities = []
     
     for example in tqdm(test_data, desc="Evaluating"):
         # Extract prompt and reference
@@ -99,38 +136,34 @@ def evaluate(model, tokenizer, test_file, args):
         full = tokenizer.decode(outputs[0], skip_special_tokens=True)
         prediction = full[len(formatted):].strip() if full.startswith(formatted) else full
         
-        # Simple exact match check (you can improve this)
-        if prediction.strip() == reference.strip():
-            correct += 1
-        total += 1
+        # Compute similarity
+        sim = code_similarity(prediction, reference)
+        similarities.append(sim)
         
         results.append({
             "task_id": example.get("task_id"),
             "source": example.get("source"),
             "reference": reference,
             "prediction": prediction,
-            "correct": (prediction.strip() == reference.strip())
+            "similarity": sim
         })
     
     # Calculate metrics
-    accuracy = correct / total if total > 0 else 0
+    avg_similarity = sum(similarities) / len(similarities) if similarities else 0
     
     # Calculate per-source metrics
-    humaneval_correct = sum(1 for r in results if r.get("source") == "humaneval" and r["correct"])
-    humaneval_total = sum(1 for r in results if r.get("source") == "humaneval")
-    
-    mbpp_correct = sum(1 for r in results if r.get("source") == "mbpp" and r["correct"])
-    mbpp_total = sum(1 for r in results if r.get("source") == "mbpp")
+    humaneval_sims = [r["similarity"] for r in results if r.get("source") == "humaneval"]
+    mbpp_sims = [r["similarity"] for r in results if r.get("source") == "mbpp"]
     
     metrics = {
         "model": args.model,
         "test_file": test_file,
-        "total_examples": total,
-        "overall_accuracy": accuracy,
-        "humaneval_accuracy": humaneval_correct / humaneval_total if humaneval_total > 0 else 0,
-        "humaneval_count": f"{humaneval_correct}/{humaneval_total}",
-        "mbpp_accuracy": mbpp_correct / mbpp_total if mbpp_total > 0 else 0,
-        "mbpp_count": f"{mbpp_correct}/{mbpp_total}"
+        "total_examples": len(results),
+        "overall_similarity": avg_similarity,
+        "humaneval_similarity": sum(humaneval_sims) / len(humaneval_sims) if humaneval_sims else 0,
+        "humaneval_count": len(humaneval_sims),
+        "mbpp_similarity": sum(mbpp_sims) / len(mbpp_sims) if mbpp_sims else 0,
+        "mbpp_count": len(mbpp_sims)
     }
     
     return results, metrics
