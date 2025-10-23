@@ -63,10 +63,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def extract_code_from_completion(completion: str) -> str:
+def extract_code_from_completion(completion: str, prompt: str = "") -> str:
     """
     Extract clean Python code from model completion.
-    Aggressive cleaning for HumanEval execution.
+    
+    The model often regenerates the prompt, so we need to:
+    1. Remove the prompt if it appears
+    2. Remove "assistant" markers
+    3. Extract only the NEW function definition after the prompt
     """
     if not completion:
         return ""
@@ -85,39 +89,72 @@ def extract_code_from_completion(completion: str) -> str:
         if end != -1:
             completion = completion[start:end].strip()
     
-    # Split into lines and filter
+    # Remove "assistant" markers that appear in the middle
+    completion = completion.replace("assistant\n", "\n")
+    completion = completion.replace("assistant ", "")
+    
+    # If we have the prompt, try to find where the NEW code starts after it
+    if prompt:
+        # Look for the function signature from the prompt
+        lines = prompt.strip().split('\n')
+        func_signature = None
+        for line in lines:
+            if line.strip().startswith('def '):
+                func_signature = line.strip()
+                break
+        
+        if func_signature:
+            # Find the SECOND occurrence of the function def (the new one)
+            # First occurrence is the prompt, second is the completion
+            parts = completion.split(func_signature)
+            if len(parts) > 2:
+                # Found it twice - take everything after the second occurrence
+                completion = func_signature + parts[2]
+            elif len(parts) == 2:
+                # Found it once - might be the new one
+                # Check if there's actual implementation after it
+                after = parts[1].strip()
+                if after and not after.startswith('"""') and not after.startswith("'''"):
+                    completion = func_signature + parts[1]
+    
+    # Split into lines and clean
     lines = completion.split('\n')
     code_lines = []
-    started_code = False
-    
-    # Patterns to skip
-    skip_patterns = [
-        'here is', 'here\'s', 'this function', 'this code', 
-        'explanation:', 'solution:', 'answer:', 'the function',
-        'i can help', 'certainly', 'of course', 'sure',
-        'below is', 'following is',
-    ]
+    in_function = False
+    found_def = False
+    skip_docstring = False
+    docstring_char = None
     
     for line in lines:
         stripped = line.strip()
-        lower = stripped.lower()
         
-        # Skip empty lines before code starts
-        if not started_code and not stripped:
+        # Track if we're in a function definition
+        if stripped.startswith('def '):
+            found_def = True
+            in_function = True
+            code_lines.append(line)
             continue
         
-        # Skip explanation lines
-        if not started_code and any(pattern in lower for pattern in skip_patterns):
-            if len(stripped) < 100:
-                continue
+        if not found_def:
+            # Skip everything before the def
+            continue
         
-        # Detect start of actual code
-        if not started_code:
-            if any(stripped.startswith(kw) for kw in ['def ', 'class ', 'import ', 'from ', '@', '    ']):
-                started_code = True
+        # Handle docstrings
+        if not skip_docstring and (stripped.startswith('"""') or stripped.startswith("'''")):
+            docstring_char = '"""' if stripped.startswith('"""') else "'''"
+            skip_docstring = True
+            if stripped.endswith(docstring_char) and len(stripped) > 6:
+                # Single-line docstring
+                skip_docstring = False
+            continue
         
-        # Once we've started, collect all lines
-        if started_code:
+        if skip_docstring:
+            if docstring_char in stripped:
+                skip_docstring = False
+            continue
+        
+        # Add code lines
+        if in_function:
             code_lines.append(line)
     
     code = '\n'.join(code_lines).strip()
@@ -199,10 +236,10 @@ def load_model_and_tokenizer(args):
 
 def generate_completion(model, tokenizer, prompt: str, args) -> str:
     """Generate completion for a HumanEval problem."""
-    # Cleaner system message
+    # Cleaner system message - emphasize completing ONLY the body
     messages = [
-        {"role": "system", "content": "Complete the Python function. Return only code, no explanations or markdown."},
-        {"role": "user", "content": prompt}
+        {"role": "system", "content": "You are an expert Python programmer. Complete the function body only. Do not rewrite the function signature or docstring."},
+        {"role": "user", "content": f"Complete this function:\n\n{prompt}"}
     ]
     
     # Format
@@ -241,8 +278,8 @@ def generate_completion(model, tokenizer, prompt: str, args) -> str:
     else:
         completion = full_output
     
-    # Clean
-    completion = extract_code_from_completion(completion)
+    # Clean with prompt context for better extraction
+    completion = extract_code_from_completion(completion, prompt)
     
     return completion
 
