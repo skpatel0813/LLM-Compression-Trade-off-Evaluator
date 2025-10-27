@@ -1,71 +1,88 @@
 #!/usr/bin/env python3
 """
 Dynamic LLM Routing System for AFSC/EN
-Routes queries to appropriate model based on complexity.
-
-Based on your Slide 4 formula:
-C ∝ P·ε + p·(1-ε)
-
-Where to route:
-  - log(P/p) ≥ 1 → Use compressed model (cheaper)
-  - Otherwise → Use full model (quality needed)
+Routes queries to appropriate model based on token complexity.
 """
 
 import re
 import json
+import tiktoken  # For token counting
 from typing import Dict, Tuple, Optional
 from pathlib import Path
 
 
-class ComplexityEstimator:
+class TokenComplexityEstimator:
     """
-    Estimate query complexity to determine which model to use.
+    Estimate query complexity based on token count and content.
     
     Complexity factors:
-    1. Query length (longer = more complex)
-    2. Technical terms (more = more complex)
-    3. Code patterns (classes, decorators = more complex)
-    4. Ambiguity (multiple interpretations = more complex)
+    1. Token count (primary factor)
+    2. Technical terms density
+    3. Code patterns
+    4. Structural complexity
     """
     
     def __init__(self):
-        # Keywords indicating high complexity
+        # Use GPT-4 tokenizer (similar to Llama tokenizer)
+        self.encoding = tiktoken.get_encoding("cl100k_base")
+        
+        # Technical keywords indicating high complexity
         self.complex_keywords = {
             'class', 'decorator', 'async', 'await', 'generator',
             'metaclass', 'abstract', 'interface', 'protocol',
             'concurrency', 'threading', 'multiprocessing',
             'optimization', 'algorithm', 'data structure',
-            'design pattern', 'architecture', 'refactor'
+            'design pattern', 'architecture', 'refactor',
+            'distributed', 'microservice', 'kubernetes', 'docker',
+            'database', 'api', 'rest', 'graphql', 'authentication',
+            'authorization', 'encryption', 'security'
         }
         
         # Simple task indicators
         self.simple_keywords = {
             'hello world', 'print', 'add', 'subtract', 'multiply',
             'divide', 'simple', 'basic', 'easy', 'beginner',
-            'return', 'list', 'loop', 'if', 'else'
+            'return', 'list', 'loop', 'if', 'else', 'variable',
+            'function', 'calculate', 'sum', 'average'
         }
     
-    def estimate_complexity(self, query: str) -> int:
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text using tiktoken."""
+        return len(self.encoding.encode(text))
+    
+    def estimate_complexity(self, query: str) -> Tuple[int, int]:
         """
-        Estimate query complexity on scale of 1-10.
+        Estimate query complexity based on tokens and content.
         
-        1-3: Simple (use 4-bit)
-        4-7: Medium (use 8B full)
-        8-10: Complex (use 70B)
+        Returns:
+            Tuple[token_count, complexity_score(1-10)]
         """
         query_lower = query.lower()
+        token_count = self.count_tokens(query)
         score = 5  # Start at medium
         
-        # Factor 1: Length
-        word_count = len(query.split())
-        if word_count < 20:
+        # Factor 1: Token count (primary driver)
+        if token_count < 50:
             score -= 2
-        elif word_count > 50:
+        elif token_count < 100:
+            score -= 1
+        elif token_count > 300:
             score += 2
+        elif token_count > 500:
+            score += 3
         
-        # Factor 2: Technical complexity
+        # Factor 2: Technical complexity density
+        total_words = len(query.split())
         complex_count = sum(1 for kw in self.complex_keywords if kw in query_lower)
         simple_count = sum(1 for kw in self.simple_keywords if kw in query_lower)
+        
+        if total_words > 0:
+            complexity_density = complex_count / total_words
+            if complexity_density > 0.3:  # 30%+ technical terms
+                score += 2
+            elif complexity_density > 0.1:  # 10%+ technical terms
+                score += 1
+        
         score += complex_count
         score -= simple_count
         
@@ -76,20 +93,24 @@ class ComplexityEstimator:
             score += 1
         if re.search(r'def.*\(.*\).*->', query):  # Type hints
             score += 1
+        if 'import ' in query:  # Imports
+            score += 1
         
         # Factor 4: Multiple requirements
-        if query.count('and') > 2:
+        if query.count('and') > 2 or query.count('or') > 2:
             score += 1
         if query.count(',') > 3:
             score += 1
         
         # Clamp to 1-10
-        return max(1, min(10, score))
+        complexity_score = max(1, min(10, score))
+        
+        return token_count, complexity_score
 
 
 class ModelRouter:
     """
-    Routes queries to appropriate model based on complexity and cost.
+    Routes queries to appropriate model based on token complexity and cost.
     """
     
     def __init__(self, 
@@ -100,280 +121,263 @@ class ModelRouter:
             complexity_thresholds: {model: (min_score, max_score)}
             model_costs: {model: relative_cost}
         """
-        self.estimator = ComplexityEstimator()
+        self.estimator = TokenComplexityEstimator()
         
-        # Default thresholds
+        # Default thresholds based on token complexity
         self.thresholds = complexity_thresholds or {
-            '4bit': (0, 3),   # Simple queries
-            '8B': (3, 7),     # Medium queries
-            '70B': (7, 10),   # Complex queries
+            'distilled': (0, 3),   # Simple queries, low tokens
+            '8B': (3, 7),         # Medium queries
+            '70B': (7, 10),       # Complex queries, high tokens
         }
         
         # Default costs (relative to 70B)
         self.costs = model_costs or {
-            '4bit': 0.03,
-            '8B': 0.11,
-            '70B': 1.0,
+            'distilled': 0.02,    # Even cheaper than 4bit
+            '8B': 0.11,           # Student model
+            '70B': 1.0,           # Teacher model
         }
         
-        # Performance expectations (from your HumanEval results)
+        # Performance expectations (adjust based on your eval results)
         self.performance = {
-            '4bit': 0.476,  # 47.6% pass@1
-            '8B': 0.524,    # 52.4% pass@1
-            '70B': 0.683,   # 68.3% pass@1
+            'distilled': 0.45,    # Estimated performance
+            '8B': 0.524,          # From your data
+            '70B': 0.683,         # From your data
+        }
+        
+        # Token limits for context management
+        self.token_limits = {
+            'distilled': 2048,    # Smaller context
+            '8B': 4096,           # Standard context
+            '70B': 8192,          # Larger context
         }
     
     def route(self, query: str) -> Dict:
         """
-        Determine which model to use for a query.
+        Determine which model to use for a query based on tokens.
         
         Returns:
             {
-                'model': '4bit' | '8B' | '70B',
+                'model': 'distilled' | '8B' | '70B',
+                'token_count': int,
                 'complexity': int (1-10),
                 'cost': float,
-                'expected_performance': float
+                'expected_performance': float,
+                'within_token_limit': bool,
+                'reasoning': str
             }
         """
-        complexity = self.estimator.estimate_complexity(query)
+        token_count, complexity = self.estimator.estimate_complexity(query)
         
         # Select model based on complexity
         for model, (min_score, max_score) in self.thresholds.items():
             if min_score <= complexity <= max_score:
+                within_limit = token_count <= self.token_limits[model]
                 return {
                     'model': model,
+                    'token_count': token_count,
                     'complexity': complexity,
                     'cost': self.costs[model],
                     'expected_performance': self.performance[model],
-                    'reasoning': self._get_reasoning(complexity, model)
+                    'within_token_limit': within_limit,
+                    'reasoning': self._get_reasoning(token_count, complexity, model, within_limit)
                 }
         
         # Default to 70B if nothing matches
+        within_limit = token_count <= self.token_limits['70B']
         return {
             'model': '70B',
+            'token_count': token_count,
             'complexity': complexity,
             'cost': self.costs['70B'],
             'expected_performance': self.performance['70B'],
+            'within_token_limit': within_limit,
             'reasoning': 'Default to highest quality'
         }
     
-    def _get_reasoning(self, complexity: int, model: str) -> str:
-        """Explain routing decision."""
-        if complexity <= 3:
-            return f"Simple query (complexity={complexity}) → Use 4-bit for 97% cost savings"
-        elif complexity <= 7:
-            return f"Medium query (complexity={complexity}) → Use 8B for 89% cost savings"
-        else:
-            return f"Complex query (complexity={complexity}) → Use 70B for best quality"
-
-
-def evaluate_routing_strategy(humaneval_results_dir: str = "results"):
-    """
-    Evaluate routing strategy on HumanEval problems.
-    Shows what the cost/performance would be with routing vs always-70B.
-    """
-    from human_eval.data import read_problems
-    
-    router = ModelRouter()
-    problems = read_problems()
-    
-    # Load actual performance data
-    results = {}
-    for model_name in ['70B', '8B', '4bit']:
-        metrics_file = Path(humaneval_results_dir) / f"teacher_{model_name}_final.metrics.json" \
-                       if '70B' in model_name else \
-                       Path(humaneval_results_dir) / f"student_{model_name}_final.metrics.json"
+    def _get_reasoning(self, token_count: int, complexity: int, model: str, within_limit: bool) -> str:
+        """Explain routing decision with token info."""
+        limit_status = "✓ within limit" if within_limit else "⚠ over limit"
         
-        if metrics_file.exists():
-            with open(metrics_file) as f:
-                results[model_name] = json.load(f)
-    
-    # Analyze routing decisions
-    routing_decisions = {}
-    for task_id, problem in problems.items():
-        prompt = problem['prompt']
-        decision = router.route(prompt)
-        routing_decisions[task_id] = decision
-    
-    # Calculate statistics
-    model_counts = {'4bit': 0, '8B': 0, '70B': 0}
-    for decision in routing_decisions.values():
-        model_counts[decision['model']] += 1
-    
-    total = len(routing_decisions)
-    
-    print("="*70)
-    print("ROUTING STRATEGY EVALUATION")
-    print("="*70)
-    
-    print(f"\nQuery Distribution ({total} problems):")
-    print(f"  4-bit:  {model_counts['4bit']:3d} ({model_counts['4bit']/total*100:5.1f}%)")
-    print(f"  8B:     {model_counts['8B']:3d} ({model_counts['8B']/total*100:5.1f}%)")
-    print(f"  70B:    {model_counts['70B']:3d} ({model_counts['70B']/total*100:5.1f}%)")
-    
-    # Calculate weighted costs
-    baseline_cost = 1.0 * total  # Always use 70B
-    routed_cost = sum(router.costs[d['model']] for d in routing_decisions.values())
-    savings = (baseline_cost - routed_cost) / baseline_cost * 100
-    
-    print(f"\nCost Analysis:")
-    print(f"  Baseline (always 70B): {baseline_cost:.2f} units")
-    print(f"  With routing:          {routed_cost:.2f} units")
-    print(f"  Savings:               {savings:.1f}%")
-    
-    # Expected performance (weighted average)
-    expected_perf = sum(
-        router.performance[d['model']] for d in routing_decisions.values()
-    ) / total
-    
-    baseline_perf = router.performance['70B']
-    perf_loss = (baseline_perf - expected_perf) * 100
-    
-    print(f"\nPerformance Analysis:")
-    print(f"  Baseline (always 70B): {baseline_perf*100:.1f}% pass@1")
-    print(f"  With routing:          {expected_perf*100:.1f}% pass@1")
-    print(f"  Performance loss:      {perf_loss:.1f}pp")
-    
-    # Show some examples
-    print(f"\nExample Routing Decisions:")
-    print("-"*70)
-    for i, (task_id, decision) in enumerate(list(routing_decisions.items())[:5]):
-        problem = problems[task_id]
-        prompt_preview = problem['prompt'].split('\n')[0][:50]
-        print(f"\n{i+1}. {task_id}")
-        print(f"   Prompt: {prompt_preview}...")
-        print(f"   → {decision['model']} (complexity={decision['complexity']})")
-        print(f"   → {decision['reasoning']}")
-    
-    print("="*70)
-    
-    return routing_decisions
+        if complexity <= 3:
+            return f"Simple query ({token_count}tokens, complexity={complexity}) → Use distilled for 98% cost savings {limit_status}"
+        elif complexity <= 7:
+            return f"Medium query ({token_count}tokens, complexity={complexity}) → Use 8B for 89% cost savings {limit_status}"
+        else:
+            return f"Complex query ({token_count}tokens, complexity={complexity}) → Use 70B for best quality {limit_status}"
 
 
-def simulate_production_deployment(queries_per_day: int = 10000,
-                                   cost_per_gpu_hour: float = 3.0):
+def evaluate_routing_strategy_on_datasets(datasets_dir: str = "datasets"):
     """
-    Simulate annual costs for AFSC/EN deployment.
+    Evaluate routing strategy on HumanEval and MBPP problems with token analysis.
     """
+    try:
+        from human_eval.data import read_problems
+        # For MBPP, you might need to import from your local dataset files
+    except ImportError:
+        print("HumanEval package not available, using simulated data")
+        return
+    
     router = ModelRouter()
     
-    # Assume query distribution matches HumanEval complexity distribution
-    # For production, these would come from actual query logs
-    sample_queries = {
-        'simple': [
-            "Write a function to add two numbers",
-            "Print hello world",
-            "Create a function that returns the sum of a list",
-        ],
-        'medium': [
-            "Implement a binary search algorithm",
-            "Create a REST API endpoint for user authentication",
-            "Write a function to parse JSON and extract nested fields",
-        ],
-        'complex': [
-            "Design a distributed caching system with automatic failover",
-            "Implement a thread-safe singleton pattern with lazy initialization",
-            "Create an async web scraper with rate limiting and retry logic",
-        ]
+    # Load HumanEval problems
+    humaneval_problems = read_problems()
+    
+    # For MBPP, you would load similarly
+    # mbpp_problems = load_mbpp_problems()
+    
+    print("="*80)
+    print("TOKEN-BASED ROUTING EVALUATION")
+    print("="*80)
+    
+    # Analyze routing decisions with token counts
+    datasets = {
+        'HumanEval': humaneval_problems,
+        # 'MBPP': mbpp_problems  # Add when available
     }
     
-    # Estimate distribution (would use real logs in production)
-    distribution = {
-        'simple': 0.75,   # 75% of queries are simple
-        'medium': 0.20,   # 20% are medium
-        'complex': 0.05,  # 5% are complex
-    }
+    for dataset_name, problems in datasets.items():
+        print(f"\n{dataset_name} Dataset Analysis:")
+        print("-" * 50)
+        
+        routing_decisions = {}
+        token_stats = []
+        
+        for task_id, problem in problems.items():
+            prompt = problem['prompt']
+            decision = router.route(prompt)
+            routing_decisions[task_id] = decision
+            token_stats.append(decision['token_count'])
+        
+        # Calculate statistics
+        model_counts = {'distilled': 0, '8B': 0, '70B': 0}
+        for decision in routing_decisions.values():
+            model_counts[decision['model']] += 1
+        
+        total = len(routing_decisions)
+        
+        print(f"Total problems: {total}")
+        print(f"Token statistics:")
+        print(f"  Min: {min(token_stats)} tokens")
+        print(f"  Max: {max(token_stats)} tokens")
+        print(f"  Avg: {sum(token_stats)/len(token_stats):.1f} tokens")
+        
+        print(f"\nModel Distribution:")
+        for model in ['distilled', '8B', '70B']:
+            count = model_counts[model]
+            percentage = count / total * 100
+            print(f"  {model:10}: {count:3d} problems ({percentage:5.1f}%)")
+        
+        # Cost analysis
+        baseline_cost = 1.0 * total  # Always use 70B
+        routed_cost = sum(router.costs[d['model']] for d in routing_decisions.values())
+        savings = (baseline_cost - routed_cost) / baseline_cost * 100
+        
+        print(f"\nCost Analysis:")
+        print(f"  Baseline (always 70B): {baseline_cost:.2f} units")
+        print(f"  With routing:          {routed_cost:.2f} units")
+        print(f"  Savings:               {savings:.1f}%")
+        
+        # Show token-based examples
+        print(f"\nToken-based Routing Examples:")
+        print("-" * 50)
+        for i, (task_id, decision) in enumerate(list(routing_decisions.items())[:3]):
+            problem = problems[task_id]
+            prompt_preview = problem['prompt'].split('\n')[0][:60]
+            print(f"\n{i+1}. {task_id}")
+            print(f"   Prompt: {prompt_preview}...")
+            print(f"   Tokens: {decision['token_count']}")
+            print(f"   → {decision['model']} (complexity={decision['complexity']})")
+            print(f"   → {decision['reasoning']}")
+
+
+def analyze_dataset_token_sizes():
+    """
+    Analyze token sizes of HumanEval and MBPP datasets.
+    """
+    try:
+        from human_eval.data import read_problems
+        # Import MBPP if available
+    except ImportError:
+        print("Required packages not available")
+        return
     
-    # Model inference times (seconds per query)
-    inference_times = {
-        '4bit': 0.4,
-        '8B': 0.6,
-        '70B': 5.0,
-    }
+    estimator = TokenComplexityEstimator()
+    humaneval_problems = read_problems()
     
-    days_per_year = 365
+    print("\n" + "="*60)
+    print("DATASET TOKEN SIZE ANALYSIS")
+    print("="*60)
     
-    # Baseline: Always use 70B
-    baseline_seconds_per_day = queries_per_day * inference_times['70B']
-    baseline_gpu_hours_per_year = (baseline_seconds_per_day * days_per_year) / 3600
-    baseline_annual_cost = baseline_gpu_hours_per_year * cost_per_gpu_hour
+    # HumanEval analysis
+    humaneval_tokens = []
+    for task_id, problem in humaneval_problems.items():
+        token_count = estimator.count_tokens(problem['prompt'])
+        humaneval_tokens.append(token_count)
     
-    # With routing
-    routed_seconds_per_day = queries_per_day * (
-        distribution['simple'] * inference_times['4bit'] +
-        distribution['medium'] * inference_times['8B'] +
-        distribution['complex'] * inference_times['70B']
-    )
-    routed_gpu_hours_per_year = (routed_seconds_per_day * days_per_year) / 3600
-    routed_annual_cost = routed_gpu_hours_per_year * cost_per_gpu_hour
+    print(f"\nHumanEval Dataset:")
+    print(f"  Problems: {len(humaneval_tokens)}")
+    print(f"  Avg tokens: {sum(humaneval_tokens)/len(humaneval_tokens):.1f}")
+    print(f"  Min tokens: {min(humaneval_tokens)}")
+    print(f"  Max tokens: {max(humaneval_tokens)}")
     
-    savings = baseline_annual_cost - routed_annual_cost
-    savings_pct = (savings / baseline_annual_cost) * 100
+    # Token distribution
+    bins = [0, 100, 200, 300, 400, 500, float('inf')]
+    distribution = [0] * (len(bins) - 1)
     
-    print("="*70)
-    print("PRODUCTION DEPLOYMENT COST SIMULATION")
-    print("="*70)
+    for tokens in humaneval_tokens:
+        for i in range(len(bins) - 1):
+            if bins[i] <= tokens < bins[i + 1]:
+                distribution[i] += 1
+                break
+        if tokens >= bins[-2]:
+            distribution[-1] += 1
     
-    print(f"\nAssumptions:")
-    print(f"  Queries per day: {queries_per_day:,}")
-    print(f"  GPU cost: ${cost_per_gpu_hour:.2f}/hour")
-    print(f"  Query distribution: {distribution}")
-    
-    print(f"\nBaseline (Always 70B):")
-    print(f"  GPU hours/year: {baseline_gpu_hours_per_year:,.0f}")
-    print(f"  Annual cost: ${baseline_annual_cost:,.2f}")
-    
-    print(f"\nWith Dynamic Routing:")
-    print(f"  GPU hours/year: {routed_gpu_hours_per_year:,.0f}")
-    print(f"  Annual cost: ${routed_annual_cost:,.2f}")
-    
-    print(f"\n💰 SAVINGS:")
-    print(f"  Annual: ${savings:,.2f}")
-    print(f"  Percentage: {savings_pct:.1f}%")
-    
-    print("="*70)
+    print(f"\nToken Distribution:")
+    for i in range(len(distribution)):
+        if i < len(distribution) - 1:
+            range_str = f"{bins[i]}-{bins[i+1]-1}"
+        else:
+            range_str = f"{bins[-2]}+"
+        print(f"  {range_str:8} tokens: {distribution[i]:3d} problems")
 
 
 if __name__ == "__main__":
-    import sys
+    # Install required package: pip install tiktoken
     
     print("\n" + "="*70)
-    print("AFSC/EN Dynamic LLM Routing System Demo")
+    print("TOKEN-BASED LLM ROUTING SYSTEM")
     print("="*70)
     
-    # Demo: Route some example queries
+    # Demo with token analysis
     router = ModelRouter()
     
     test_queries = [
         "Write a function to check if a number is even",
         "Implement a binary search tree with insert, delete, and search operations",
-        "Design a microservices architecture for a real-time analytics platform with fault tolerance",
+        "Design a microservices architecture for a real-time analytics platform with fault tolerance and load balancing across multiple availability zones",
         "Print 'Hello, World!' to the console",
-        "Create a RESTful API with JWT authentication and role-based access control",
+        "Create a RESTful API with JWT authentication, role-based access control, rate limiting, and request validation using FastAPI",
     ]
     
-    print("\n1. ROUTING EXAMPLES")
+    print("\n1. TOKEN-BASED ROUTING EXAMPLES")
     print("-"*70)
     for i, query in enumerate(test_queries, 1):
         decision = router.route(query)
-        print(f"\n{i}. Query: {query[:60]}...")
+        print(f"\n{i}. Query: {query[:50]}...")
+        print(f"   → Tokens: {decision['token_count']}")
         print(f"   → Model: {decision['model']}")
         print(f"   → Complexity: {decision['complexity']}/10")
         print(f"   → Cost: {decision['cost']:.3f}× (vs 70B)")
         print(f"   → {decision['reasoning']}")
     
-    # Evaluate on HumanEval
-    print("\n\n2. HUMANEVAL EVALUATION")
+    # Analyze dataset token sizes
+    print("\n\n2. DATASET TOKEN ANALYSIS")
     print("-"*70)
-    try:
-        evaluate_routing_strategy()
-    except Exception as e:
-        print(f"Note: Run after HumanEval results are available")
-        print(f"Error: {e}")
+    analyze_dataset_token_sizes()
     
-    # Production simulation
-    print("\n\n3. PRODUCTION COST SIMULATION")
+    # Evaluate routing strategy
+    print("\n\n3. ROUTING STRATEGY EVALUATION")
     print("-"*70)
-    simulate_production_deployment(queries_per_day=10000, cost_per_gpu_hour=3.0)
+    evaluate_routing_strategy_on_datasets()
     
-    print("\n✓ Demo complete!\n")
+    print("\n✓ Token-based routing demo complete!\n")
