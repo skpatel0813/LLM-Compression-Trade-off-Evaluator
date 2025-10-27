@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Dynamic LLM Routing System for AFSC/EN
-Routes queries to appropriate model based on token complexity.
+Routes queries to appropriate model based on token complexity and actual performance data.
 """
 
 import json
 from typing import Dict, Tuple, Optional
 from pathlib import Path
-import tiktoken  # For token counting
+import tiktoken
 
 
 class ComplexityEstimator:
@@ -22,62 +22,53 @@ class ComplexityEstimator:
         """
         Estimate query complexity on scale of 1-10 based on token count.
         
-        OPTIMIZED thresholds based on your model performance:
-        - 1-100 tokens: Simple/Medium → Distilled (56.7% performance)
-        - 101-200 tokens: Complex → 8B (39.0% performance) 
-        - 201+ tokens: Very Complex → 70B (72.0% performance)
+        Optimized routing based on actual performance:
+        - 1-150 tokens: Simple/Medium -> Distilled model (56.7% performance)
+        - 151+ tokens: Complex -> 70B model (72.0% performance)
         """
         tokens = self.encoder.encode(query)
         token_count = len(tokens)
         
-        # OPTIMIZED: Send more to distilled since it outperforms 8B
-        if token_count <= 100:
-            return max(1, min(5, token_count // 20))        # Distilled: 1-5
-        elif token_count <= 200:
-            return 6 + min(2, (token_count - 101) // 50)    # 8B: 6-7
+        # Optimized: Use distilled for most queries, 70B only for complex ones
+        if token_count <= 150:
+            return max(1, min(6, token_count // 25))    # Distilled: 1-6
         else:
-            return 8 + min(2, (token_count - 201) // 100)   # 70B: 8-10
+            return 7 + min(3, (token_count - 151) // 50)  # 70B: 7-10
 
 
 class ModelRouter:
     """
-    Routes queries to appropriate model based on complexity and cost.
+    Routes queries to appropriate model based on complexity and actual performance.
     """
     
     def __init__(self, 
                  complexity_thresholds: Dict[str, Tuple[int, int]] = None,
                  model_costs: Dict[str, float] = None):
-        """
-        OPTIMIZED thresholds based on your model performance data.
-        """
+        
         self.estimator = ComplexityEstimator()
         
-        # OPTIMIZED thresholds - send more to distilled since it's better than 8B
+        # Optimized thresholds based on actual performance data
         self.thresholds = complexity_thresholds or {
-            'distilled': (1, 5),   # Simple/Medium queries: 1-100 tokens
-            '8B': (6, 7),          # Complex queries: 101-200 tokens  
-            '70B': (8, 10),        # Very Complex queries: 201+ tokens
+            'distilled': (1, 6),   # Simple/Medium queries: 1-150 tokens
+            '70B': (7, 10),        # Complex queries: 151+ tokens
         }
         
-        # Actual model names
+        # Model names
         self.model_names = {
             'distilled': 'distilled-model',
-            '8B': 'Meta-Llama-3.1-8B-Instruct',
             '70B': 'Meta-Llama-3.1-70B-Instruct'
         }
         
         # Relative costs
         self.costs = model_costs or {
             'distilled': 0.02,
-            '8B': 0.11,  
             '70B': 1.0,
         }
         
-        # YOUR ACTUAL PERFORMANCE DATA
+        # Actual performance data from evaluation
         self.performance = {
-            'distilled': 0.5671,  # 56.71% - BETTER than 8B!
-            '8B': 0.3902,         # 39.02% 
-            '70B': 0.7195,        # 71.95%
+            'distilled': 0.5671,  # 56.71% pass@1
+            '70B': 0.7195,        # 71.95% pass@1
         }
     
     def route(self, query: str) -> Dict:
@@ -99,6 +90,7 @@ class ModelRouter:
                     'reasoning': self._get_reasoning(complexity, token_count, model_type)
                 }
         
+        # Default to 70B for safety
         return {
             'model': self.model_names['70B'],
             'model_type': '70B',
@@ -106,18 +98,16 @@ class ModelRouter:
             'token_count': token_count,
             'cost': self.costs['70B'],
             'expected_performance': self.performance['70B'],
-            'reasoning': f'Complex query ({token_count} tokens) → Use 70B for best quality ({self.performance["70B"]*100:.1f}% pass@1)'
+            'reasoning': f'Complex query ({token_count} tokens) -> Use 70B for best quality ({self.performance["70B"]*100:.1f}% pass@1)'
         }
     
     def _get_reasoning(self, complexity: int, token_count: int, model_type: str) -> str:
         """Explain routing decision based on token count."""
         performance_pct = self.performance[model_type] * 100
-        if complexity <= 5:
-            return f"Simple/Medium query ({token_count} tokens) → Use distilled model for 98% cost savings ({performance_pct:.1f}% pass@1)"
-        elif complexity <= 7:
-            return f"Complex query ({token_count} tokens) → Use 8B for 89% cost savings ({performance_pct:.1f}% pass@1)"
+        if complexity <= 6:
+            return f"Simple/Medium query ({token_count} tokens) -> Use distilled model for 98% cost savings ({performance_pct:.1f}% pass@1)"
         else:
-            return f"Very complex query ({token_count} tokens) → Use 70B for best quality ({performance_pct:.1f}% pass@1)"
+            return f"Complex query ({token_count} tokens) -> Use 70B for best quality ({performance_pct:.1f}% pass@1)"
 
 
 def evaluate_routing_strategy():
@@ -138,8 +128,8 @@ def evaluate_routing_strategy():
         routing_decisions[task_id] = decision
     
     # Calculate statistics
-    model_counts = {'distilled': 0, '8B': 0, '70B': 0}
-    token_stats = {'distilled': [], '8B': [], '70B': []}
+    model_counts = {'distilled': 0, '70B': 0}
+    token_stats = {'distilled': [], '70B': []}
     
     for decision in routing_decisions.values():
         model_type = decision['model_type']
@@ -148,19 +138,19 @@ def evaluate_routing_strategy():
     
     total = len(routing_decisions)
     
-    print("="*70)
-    print("ROUTING STRATEGY EVALUATION (Token-Based)")
-    print("="*70)
+    print("=" * 70)
+    print("OPTIMIZED ROUTING STRATEGY EVALUATION")
+    print("=" * 70)
     
     print(f"\nQuery Distribution ({total} problems):")
-    for model_type in ['distilled', '8B', '70B']:
+    for model_type in ['distilled', '70B']:
         count = model_counts[model_type]
         avg_tokens = sum(token_stats[model_type]) / len(token_stats[model_type]) if token_stats[model_type] else 0
         performance = router.performance[model_type] * 100
         print(f"  {model_type:10}: {count:3d} ({count/total*100:5.1f}%) - Avg: {avg_tokens:.0f} tokens, {performance:.1f}% pass@1")
     
     # Calculate weighted costs
-    baseline_cost = 1.0 * total  # Always use 70B
+    baseline_cost = 1.0 * total
     routed_cost = sum(router.costs[d['model_type']] for d in routing_decisions.values())
     savings = (baseline_cost - routed_cost) / baseline_cost * 100
     
@@ -169,7 +159,7 @@ def evaluate_routing_strategy():
     print(f"  With routing:          {routed_cost:.2f} units")
     print(f"  Savings:               {savings:.1f}%")
     
-    # Expected performance (weighted average)
+    # Expected performance
     baseline_perf = router.performance['70B']
     expected_perf = sum(router.performance[d['model_type']] for d in routing_decisions.values()) / total
     perf_loss = (baseline_perf - expected_perf) * 100
@@ -197,27 +187,27 @@ def evaluate_routing_strategy():
     
     # Show some examples
     print(f"\nExample Routing Decisions:")
-    print("-"*70)
+    print("-" * 70)
     for i, (task_id, decision) in enumerate(list(routing_decisions.items())[:5]):
         problem = problems[task_id]
         prompt_preview = problem['prompt'].split('\n')[0][:50]
         print(f"\n{i+1}. {task_id}")
         print(f"   Prompt: {prompt_preview}...")
         print(f"   Tokens: {decision['token_count']}")
-        print(f"   → {decision['model']} (complexity={decision['complexity']})")
-        print(f"   → {decision['reasoning']}")
+        print(f"   -> {decision['model']} (complexity={decision['complexity']})")
+        print(f"   -> {decision['reasoning']}")
     
-    print("="*70)
+    print("=" * 70)
     
     return routing_decisions
 
 
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("AFSC/EN Dynamic LLM Routing System")
-    print("="*70)
+    print("\n" + "=" * 70)
+    print("AFSC/EN Optimized LLM Routing System")
+    print("=" * 70)
     
-    # Demo: Route some example queries
+    # Demo with test queries
     router = ModelRouter()
     
     test_queries = [
@@ -229,24 +219,24 @@ if __name__ == "__main__":
     ]
     
     print("\n1. ROUTING EXAMPLES")
-    print("-"*70)
+    print("-" * 70)
     for i, query in enumerate(test_queries, 1):
         decision = router.route(query)
         print(f"\n{i}. Query: {query[:60]}...")
-        print(f"   → Tokens: {decision['token_count']}")
-        print(f"   → Model: {decision['model']}")
-        print(f"   → Complexity: {decision['complexity']}/10")
-        print(f"   → Cost: {decision['cost']:.3f}× (vs 70B)")
-        print(f"   → Expected performance: {decision['expected_performance']*100:.1f}% pass@1")
-        print(f"   → {decision['reasoning']}")
+        print(f"   -> Tokens: {decision['token_count']}")
+        print(f"   -> Model: {decision['model']}")
+        print(f"   -> Complexity: {decision['complexity']}/10")
+        print(f"   -> Cost: {decision['cost']:.3f}x (vs 70B)")
+        print(f"   -> Expected performance: {decision['expected_performance']*100:.1f}% pass@1")
+        print(f"   -> {decision['reasoning']}")
     
     # Evaluate on HumanEval
     print("\n\n2. HUMANEVAL EVALUATION")
-    print("-"*70)
+    print("-" * 70)
     try:
         evaluate_routing_strategy()
     except Exception as e:
         print(f"Note: Run after HumanEval results are available")
         print(f"Error: {e}")
     
-    print("\n✓ Routing system evaluation complete!\n")
+    print("\nOptimized routing system evaluation complete.")
