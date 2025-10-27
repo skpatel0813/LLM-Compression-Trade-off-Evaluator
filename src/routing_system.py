@@ -110,6 +110,36 @@ class ModelRouter:
             return f"Complex query ({token_count} tokens) -> Use 70B for best quality ({performance_pct:.1f}% pass@1)"
 
 
+def get_humaneval_examples():
+    """
+    Return actual HumanEval problems as examples.
+    """
+    from human_eval.data import read_problems
+    
+    problems = read_problems()
+    
+    # Select 5 diverse examples from HumanEval
+    example_ids = [
+        'HumanEval/0',  # has_close_elements
+        'HumanEval/1',  # separate_paren_groups
+        'HumanEval/2',  # truncate_number
+        'HumanEval/28', # concatenate - medium complexity
+        'HumanEval/155' # largest_smallest_integers - higher complexity
+    ]
+    
+    examples = []
+    for task_id in example_ids:
+        if task_id in problems:
+            problem = problems[task_id]
+            examples.append({
+                'task_id': task_id,
+                'prompt': problem['prompt'],
+                'entry_point': problem['entry_point']
+            })
+    
+    return examples
+
+
 def evaluate_routing_strategy():
     """
     Evaluate routing strategy on HumanEval problems using actual token counts.
@@ -185,20 +215,6 @@ def evaluate_routing_strategy():
     print(f"  Max: {max(all_tokens)} tokens") 
     print(f"  Avg: {sum(all_tokens)/len(all_tokens):.1f} tokens")
     
-    # Show some examples
-    print(f"\nExample Routing Decisions:")
-    print("-" * 70)
-    for i, (task_id, decision) in enumerate(list(routing_decisions.items())[:5]):
-        problem = problems[task_id]
-        prompt_preview = problem['prompt'].split('\n')[0][:50]
-        print(f"\n{i+1}. {task_id}")
-        print(f"   Prompt: {prompt_preview}...")
-        print(f"   Tokens: {decision['token_count']}")
-        print(f"   -> {decision['model']} (complexity={decision['complexity']})")
-        print(f"   -> {decision['reasoning']}")
-    
-    print("=" * 70)
-    
     return routing_decisions
 
 
@@ -207,31 +223,47 @@ if __name__ == "__main__":
     print("AFSC/EN Optimized LLM Routing System")
     print("=" * 70)
     
-    # Demo with test queries
+    # Demo with actual HumanEval examples
     router = ModelRouter()
     
-    test_queries = [
-        "Write a function to check if a number is even",
-        "Implement a binary search tree with insert, delete, and search operations",
-        "Design a microservices architecture for a real-time analytics platform with fault tolerance and load balancing across multiple availability zones",
-        "Print 'Hello, World!' to the console",
-        "Create a RESTful API with JWT authentication and role-based access control using FastAPI with SQLAlchemy ORM and PostgreSQL backend",
-    ]
-    
-    print("\n1. ROUTING EXAMPLES")
+    print("\n1. HUMANEVAL ROUTING EXAMPLES")
     print("-" * 70)
-    for i, query in enumerate(test_queries, 1):
-        decision = router.route(query)
-        print(f"\n{i}. Query: {query[:60]}...")
-        print(f"   -> Tokens: {decision['token_count']}")
-        print(f"   -> Model: {decision['model']}")
-        print(f"   -> Complexity: {decision['complexity']}/10")
-        print(f"   -> Cost: {decision['cost']:.3f}x (vs 70B)")
-        print(f"   -> Expected performance: {decision['expected_performance']*100:.1f}% pass@1")
-        print(f"   -> {decision['reasoning']}")
     
-    # Evaluate on HumanEval
-    print("\n\n2. HUMANEVAL EVALUATION")
+    try:
+        examples = get_humaneval_examples()
+        
+        for i, example in enumerate(examples, 1):
+            decision = router.route(example['prompt'])
+            print(f"\n{i}. {example['task_id']} - {example['entry_point']}")
+            print(f"   Prompt preview: {example['prompt'][:80]}...")
+            print(f"   -> Tokens: {decision['token_count']}")
+            print(f"   -> Model: {decision['model']}")
+            print(f"   -> Complexity: {decision['complexity']}/10")
+            print(f"   -> Cost: {decision['cost']:.3f}x (vs 70B)")
+            print(f"   -> Expected performance: {decision['expected_performance']*100:.1f}% pass@1")
+            print(f"   -> {decision['reasoning']}")
+            
+    except Exception as e:
+        print(f"Error loading HumanEval examples: {e}")
+        # Fallback to simple test queries
+        test_queries = [
+            "Write a function to check if a number is even",
+            "Implement a binary search tree with insert, delete, and search operations",
+            "Design a microservices architecture for a real-time analytics platform",
+        ]
+        
+        for i, query in enumerate(test_queries, 1):
+            decision = router.route(query)
+            print(f"\n{i}. Query: {query[:60]}...")
+            print(f"   -> Tokens: {decision['token_count']}")
+            print(f"   -> Model: {decision['model']}")
+            print(f"   -> Complexity: {decision['complexity']}/10")
+            print(f"   -> Cost: {decision['cost']:.3f}x (vs 70B)")
+            print(f"   -> Expected performance: {decision['expected_performance']*100:.1f}% pass@1")
+            print(f"   -> {decision['reasoning']}")
+    
+    # Evaluate on full HumanEval dataset
+    print("\n\n2. FULL HUMANEVAL EVALUATION")
     print("-" * 70)
     try:
         evaluate_routing_strategy()
