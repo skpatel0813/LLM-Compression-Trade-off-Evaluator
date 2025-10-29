@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-eval_humaneval.py - HumanEval benchmark evaluation for LLMs (FIXED VERSION)
+eval_humaneval.py - HumanEval benchmark evaluation for LLMs (ENHANCED VERSION)
 
-This version has improved code extraction for better HumanEval pass rates.
+Features:
+- Improved code extraction for better HumanEval pass rates
+- Pass@k metrics: pass@1, pass@5, pass@10
+- GPU & power consumption tracking with wandb
+- Comprehensive metrics logging
 """
 
 import argparse
@@ -11,7 +15,9 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+import threading
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -40,27 +46,170 @@ try:
 except ImportError:
     HAS_BNB = False
 
+# Wandb for tracking
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+    print("WARNING: wandb not found. Install with: pip install wandb")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate LLM on HumanEval benchmark")
     
     # Model configuration
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--lora_dir", type=str, default=None)
+    parser.add_argument("--model", type=str, required=True,
+                       help="Model name or path")
+    parser.add_argument("--lora_dir", type=str, default=None,
+                       help="Path to LoRA adapters")
     
     # Quantization
-    parser.add_argument("--load_in_4bit", action="store_true")
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--bf16", action="store_true", default=True)
-    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                       help="Load model in 4-bit quantization")
+    parser.add_argument("--load_in_8bit", action="store_true",
+                       help="Load model in 8-bit quantization")
+    parser.add_argument("--bf16", action="store_true", default=True,
+                       help="Use bfloat16 precision")
+    parser.add_argument("--fp16", action="store_true",
+                       help="Use float16 precision")
     
-    # Generation
-    parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.01)
-    parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--limit", type=int, default=None)
+    # Generation parameters
+    parser.add_argument("--max_new_tokens", type=int, default=512,
+                       help="Maximum tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.01,
+                       help="Sampling temperature (use 0.01 for near-greedy)")
+    parser.add_argument("--num_samples", type=int, default=10,
+                       help="Number of samples per problem for pass@k")
+    parser.add_argument("--output", type=str, required=True,
+                       help="Output file path")
+    parser.add_argument("--limit", type=int, default=None,
+                       help="Limit number of problems (for testing)")
+    
+    # Wandb configuration
+    parser.add_argument("--wandb_project", type=str, default="humaneval-llm-eval",
+                       help="Wandb project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                       help="Wandb run name (default: auto-generated)")
+    parser.add_argument("--wandb_api_key", type=str, default=None,
+                       help="Wandb API key (or set WANDB_API_KEY env var)")
+    parser.add_argument("--no_wandb", action="store_true",
+                       help="Disable wandb logging")
     
     return parser.parse_args()
+
+
+class GPUMonitor:
+    """Monitor GPU utilization and power consumption."""
+    
+    def __init__(self, log_interval: float = 1.0):
+        """
+        Args:
+            log_interval: Seconds between measurements
+        """
+        self.log_interval = log_interval
+        self.monitoring = False
+        self.thread = None
+        self.metrics = defaultdict(list)
+        
+        # Check if pynvml is available
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self.nvml = pynvml
+            self.has_nvml = True
+            self.device_count = pynvml.nvmlDeviceGetCount()
+        except:
+            self.has_nvml = False
+            print("WARNING: pynvml not available. Install with: pip install nvidia-ml-py3")
+    
+    def _monitor_loop(self):
+        """Background monitoring loop."""
+        while self.monitoring:
+            timestamp = time.time()
+            
+            if self.has_nvml:
+                for i in range(self.device_count):
+                    try:
+                        handle = self.nvml.nvmlDeviceGetHandleByIndex(i)
+                        
+                        # GPU utilization
+                        util = self.nvml.nvmlDeviceGetUtilizationRates(handle)
+                        self.metrics[f'gpu_{i}_utilization'].append(util.gpu)
+                        self.metrics[f'gpu_{i}_memory_utilization'].append(util.memory)
+                        
+                        # Memory usage
+                        mem_info = self.nvml.nvmlDeviceGetMemoryInfo(handle)
+                        mem_used_gb = mem_info.used / (1024**3)
+                        mem_total_gb = mem_info.total / (1024**3)
+                        self.metrics[f'gpu_{i}_memory_used_gb'].append(mem_used_gb)
+                        self.metrics[f'gpu_{i}_memory_total_gb'].append(mem_total_gb)
+                        
+                        # Power consumption
+                        try:
+                            power_mw = self.nvml.nvmlDeviceGetPowerUsage(handle)
+                            power_w = power_mw / 1000.0
+                            self.metrics[f'gpu_{i}_power_watts'].append(power_w)
+                        except:
+                            pass
+                        
+                        # Temperature
+                        try:
+                            temp = self.nvml.nvmlDeviceGetTemperature(handle, self.nvml.NVML_TEMPERATURE_GPU)
+                            self.metrics[f'gpu_{i}_temperature_c'].append(temp)
+                        except:
+                            pass
+                        
+                    except Exception as e:
+                        print(f"Warning: Failed to get metrics for GPU {i}: {e}")
+            
+            # Also log timestamp
+            self.metrics['timestamp'].append(timestamp)
+            
+            time.sleep(self.log_interval)
+    
+    def start(self):
+        """Start monitoring in background thread."""
+        if not self.has_nvml:
+            return
+        
+        self.monitoring = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+    
+    def stop(self) -> Dict:
+        """Stop monitoring and return aggregated metrics."""
+        self.monitoring = False
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        
+        # Aggregate metrics
+        aggregated = {}
+        for key, values in self.metrics.items():
+            if values and key != 'timestamp':
+                aggregated[f'{key}_mean'] = sum(values) / len(values)
+                aggregated[f'{key}_max'] = max(values)
+                aggregated[f'{key}_min'] = min(values)
+        
+        # Calculate total energy consumption
+        for i in range(self.device_count if self.has_nvml else 0):
+            power_key = f'gpu_{i}_power_watts'
+            if power_key in self.metrics and self.metrics[power_key]:
+                # Energy = average power * time
+                avg_power = aggregated.get(f'{power_key}_mean', 0)
+                duration = (self.metrics['timestamp'][-1] - self.metrics['timestamp'][0])
+                energy_wh = (avg_power * duration) / 3600.0  # Watt-hours
+                aggregated[f'gpu_{i}_energy_wh'] = energy_wh
+        
+        return aggregated
+    
+    def get_current_metrics(self) -> Dict:
+        """Get latest measurements."""
+        current = {}
+        for key, values in self.metrics.items():
+            if values and key != 'timestamp':
+                current[key] = values[-1]
+        return current
 
 
 def extract_code_from_completion(completion: str, prompt: str = "") -> str:
@@ -203,10 +352,12 @@ def load_model_and_tokenizer(args):
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
+        print("Using 4-bit quantization")
     elif args.load_in_8bit:
         if not HAS_BNB:
             raise RuntimeError("8-bit requires bitsandbytes")
         model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        print("Using 8-bit quantization")
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
@@ -225,16 +376,21 @@ def load_model_and_tokenizer(args):
         model = PeftModel.from_pretrained(model, args.lora_dir)
         try:
             model = model.merge_and_unload()
+            print("LoRA merged successfully")
         except:
-            pass
+            print("Could not merge LoRA (continuing with adapter)")
     
     model.eval()
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
     
     print(f"{'='*70}\n")
     return model, tokenizer
 
 
-def generate_completion(model, tokenizer, prompt: str, args) -> str:
+def generate_completion(model, tokenizer, prompt: str, args, sample_idx: int = 0) -> str:
     """Generate completion for a HumanEval problem."""
     # Cleaner system message - emphasize completing ONLY the body
     messages = [
@@ -257,13 +413,19 @@ def generate_completion(model, tokenizer, prompt: str, args) -> str:
         max_length=2048
     ).to(model.device)
     
-    # Generate (greedy decoding)
+    # Adjust temperature for sampling
+    # For pass@k, we want diversity when k>1
+    temp = args.temperature if args.num_samples == 1 else max(0.8, args.temperature)
+    do_sample = (temp > 0.0) and (args.num_samples > 1)
+    
+    # Generate
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            do_sample=(args.temperature > 0.0),
+            temperature=temp,
+            do_sample=do_sample,
+            top_p=0.95 if do_sample else None,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             use_cache=True,
@@ -284,8 +446,8 @@ def generate_completion(model, tokenizer, prompt: str, args) -> str:
     return completion
 
 
-def evaluate_humaneval(model, tokenizer, args):
-    """Run HumanEval evaluation."""
+def evaluate_humaneval(model, tokenizer, args, gpu_monitor: Optional[GPUMonitor] = None):
+    """Run HumanEval evaluation with pass@k metrics."""
     print(f"\n{'='*70}")
     print("HumanEval Evaluation")
     print(f"{'='*70}")
@@ -297,85 +459,211 @@ def evaluate_humaneval(model, tokenizer, args):
         problems = dict(list(problems.items())[:args.limit])
     
     print(f"Total problems: {len(problems)}")
+    print(f"Samples per problem: {args.num_samples}")
+    print(f"Total generations: {len(problems) * args.num_samples}")
     print(f"{'='*70}\n")
     
-    # Generate
+    # Start GPU monitoring
+    if gpu_monitor:
+        gpu_monitor.start()
+    
+    # Generate completions
     results = []
     start_time = time.time()
     
     # Disable tokenizer warnings
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
-    for task_id, problem in tqdm(problems.items(), desc="Generating"):
-        prompt = problem["prompt"]
-        
-        try:
-            completion = generate_completion(model, tokenizer, prompt, args)
-            results.append({
-                "task_id": task_id,
-                "completion": completion,
-            })
-        except Exception as e:
-            print(f"\nError on {task_id}: {e}")
-            results.append({
-                "task_id": task_id,
-                "completion": "",
-            })
+    total_generations = len(problems) * args.num_samples
+    
+    with tqdm(total=total_generations, desc="Generating") as pbar:
+        for task_id, problem in problems.items():
+            prompt = problem["prompt"]
+            
+            # Generate multiple samples for pass@k
+            for sample_idx in range(args.num_samples):
+                try:
+                    completion = generate_completion(model, tokenizer, prompt, args, sample_idx)
+                    results.append({
+                        "task_id": task_id,
+                        "completion": completion,
+                    })
+                    
+                    # Log to wandb periodically
+                    if HAS_WANDB and wandb.run and gpu_monitor and len(results) % 10 == 0:
+                        current_gpu = gpu_monitor.get_current_metrics()
+                        wandb.log({
+                            "generation_progress": len(results) / total_generations,
+                            **current_gpu
+                        })
+                    
+                except Exception as e:
+                    print(f"\nError on {task_id} (sample {sample_idx}): {e}")
+                    results.append({
+                        "task_id": task_id,
+                        "completion": "",
+                    })
+                
+                pbar.update(1)
     
     elapsed = time.time() - start_time
     print(f"\nGeneration: {elapsed:.1f}s ({elapsed/len(results):.2f}s/sample)")
     
-    # Save
+    # Stop GPU monitoring
+    gpu_metrics = {}
+    if gpu_monitor:
+        gpu_metrics = gpu_monitor.stop()
+        print("\nGPU Metrics:")
+        for key, value in sorted(gpu_metrics.items()):
+            if 'mean' in key or 'energy' in key:
+                print(f"  {key}: {value:.2f}")
+    
+    # Save completions
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_jsonl(str(output_path), results)
-    print(f"Saved: {output_path}")
+    print(f"\nSaved completions: {output_path}")
     
-    # Evaluate
+    # Evaluate pass@k
     print(f"\n{'='*70}")
     print("Running tests...")
     print(f"{'='*70}\n")
     
     try:
-        metrics = evaluate_functional_correctness(str(output_path))
+        # Evaluate with different k values
+        pass_at_k = {}
+        k_values = [1, 5, 10] if args.num_samples >= 10 else [1]
+        
+        for k in k_values:
+            if k <= args.num_samples:
+                print(f"Evaluating pass@{k}...")
+                metrics = evaluate_functional_correctness(
+                    str(output_path),
+                    k=[k],
+                    n_workers=4,
+                    timeout=3.0
+                )
+                pass_at_k[k] = metrics[f'pass@{k}']
         
         print(f"\n{'='*70}")
         print("RESULTS")
         print(f"{'='*70}")
-        print(f"Pass@1: {metrics['pass@1']:.4f} ({metrics['pass@1']*100:.2f}%)")
+        for k, score in pass_at_k.items():
+            print(f"Pass@{k}: {score:.4f} ({score*100:.2f}%)")
         print(f"{'='*70}\n")
         
-        # Save metrics
+        # Save comprehensive metrics
         metrics_path = output_path.with_suffix('.metrics.json')
-        with open(metrics_path, 'w') as f:
-            json.dump({
-                'model': args.model,
-                'lora_dir': args.lora_dir,
-                'num_problems': len(problems),
-                'metrics': metrics,
-                'generation_time_sec': elapsed,
-            }, f, indent=2)
-        print(f"Metrics: {metrics_path}")
+        all_metrics = {
+            'model': args.model,
+            'lora_dir': args.lora_dir,
+            'num_problems': len(problems),
+            'num_samples_per_problem': args.num_samples,
+            'total_generations': len(results),
+            'generation_time_sec': elapsed,
+            'avg_time_per_sample': elapsed / len(results),
+            'pass_at_k': {f'pass@{k}': v for k, v in pass_at_k.items()},
+            'gpu_metrics': gpu_metrics,
+            'config': {
+                'temperature': args.temperature,
+                'max_new_tokens': args.max_new_tokens,
+                'quantization': '4bit' if args.load_in_4bit else ('8bit' if args.load_in_8bit else 'none'),
+                'dtype': 'bf16' if args.bf16 else ('fp16' if args.fp16 else 'fp32'),
+            }
+        }
         
-        return metrics
+        with open(metrics_path, 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+        print(f"Metrics saved: {metrics_path}")
+        
+        # Log to wandb
+        if HAS_WANDB and wandb.run:
+            wandb.log({
+                **{f'pass@{k}': v for k, v in pass_at_k.items()},
+                'generation_time_sec': elapsed,
+                'avg_time_per_sample': elapsed / len(results),
+                **{f'final_{k}': v for k, v in gpu_metrics.items()},
+            })
+            
+            # Upload files as artifacts
+            artifact = wandb.Artifact('humaneval_results', type='evaluation')
+            artifact.add_file(str(output_path))
+            artifact.add_file(str(metrics_path))
+            wandb.log_artifact(artifact)
+        
+        return pass_at_k
+        
     except Exception as e:
         print(f"Evaluation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def init_wandb(args):
+    """Initialize wandb logging."""
+    if args.no_wandb or not HAS_WANDB:
+        return None
+    
+    # Set API key if provided
+    if args.wandb_api_key:
+        os.environ["WANDB_API_KEY"] = args.wandb_api_key
+    
+    # Auto-generate run name if not provided
+    run_name = args.wandb_run_name
+    if not run_name:
+        model_name = Path(args.model).name
+        lora_suffix = "_lora" if args.lora_dir else ""
+        quant_suffix = "_4bit" if args.load_in_4bit else ("_8bit" if args.load_in_8bit else "")
+        run_name = f"{model_name}{lora_suffix}{quant_suffix}_humaneval"
+    
+    # Initialize
+    try:
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                "model": args.model,
+                "lora_dir": args.lora_dir,
+                "temperature": args.temperature,
+                "max_new_tokens": args.max_new_tokens,
+                "num_samples": args.num_samples,
+                "quantization": "4bit" if args.load_in_4bit else ("8bit" if args.load_in_8bit else "none"),
+                "dtype": "bf16" if args.bf16 else ("fp16" if args.fp16 else "fp32"),
+            }
+        )
+        print(f"✓ Wandb initialized: {wandb.run.url}")
+        return wandb.run
+    except Exception as e:
+        print(f"WARNING: Could not initialize wandb: {e}")
         return None
 
 
 def main():
     args = parse_args()
     
+    # Initialize wandb
+    wandb_run = init_wandb(args)
+    
+    # Initialize GPU monitor
+    gpu_monitor = GPUMonitor(log_interval=1.0)
+    
     # Load model
     model, tokenizer = load_model_and_tokenizer(args)
     
     # Evaluate
-    metrics = evaluate_humaneval(model, tokenizer, args)
+    pass_at_k = evaluate_humaneval(model, tokenizer, args, gpu_monitor)
     
-    if metrics:
-        print(f"\n✓ Complete! Pass@1: {metrics['pass@1']*100:.2f}%")
+    if pass_at_k:
+        print(f"\n✓ Complete!")
+        for k, score in pass_at_k.items():
+            print(f"  Pass@{k}: {score*100:.2f}%")
     else:
         print(f"\n⚠ Completed with errors")
+    
+    # Finish wandb
+    if wandb_run:
+        wandb.finish()
     
     return 0
 
