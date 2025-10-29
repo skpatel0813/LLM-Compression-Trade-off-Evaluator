@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Dynamic LLM Routing System for AFSC/EN
-Routes queries to appropriate model based on token complexity and actual performance data.
+Comprehensive LLM Routing System Evaluation
+Evaluates distilled and 70B models on different complexity levels with wandb logging.
 """
 
 import json
-from typing import Dict, Tuple, Optional
+import os
+import sys
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+import subprocess
 import tiktoken
+from collections import defaultdict
 
 
 class ComplexityEstimator:
@@ -23,8 +27,8 @@ class ComplexityEstimator:
         Estimate query complexity on scale of 1-10 based on token count.
         
         Optimized routing based on actual performance:
-        - 1-150 tokens: Simple/Medium -> Distilled model (56.7% performance)
-        - 151+ tokens: Complex -> 70B model (72.0% performance)
+        - 1-150 tokens: Simple/Medium -> Distilled model (complexity 1-6)
+        - 151+ tokens: Complex -> 70B model (complexity 7-10)
         """
         tokens = self.encoder.encode(query)
         token_count = len(tokens)
@@ -36,207 +40,507 @@ class ComplexityEstimator:
             return 7 + min(3, (token_count - 151) // 50)  # 70B: 7-10
 
 
-class ModelRouter:
+class RoutingEvaluator:
     """
-    Routes queries to appropriate model based on complexity and actual performance.
+    Comprehensive evaluation system for routing strategy.
     """
     
-    def __init__(self, 
-                 complexity_thresholds: Dict[str, Tuple[int, int]] = None,
-                 model_costs: Dict[str, float] = None):
+    def __init__(self,
+                 distilled_model_path: str,
+                 teacher_model_path: str,
+                 lora_dir: str,
+                 wandb_api_key: str,
+                 wandb_project: str = "LLM-Compression-Project",
+                 output_dir: str = "results"):
+        
+        self.distilled_model = distilled_model_path
+        self.teacher_model = teacher_model_path
+        self.lora_dir = lora_dir
+        self.wandb_api_key = wandb_api_key
+        self.wandb_project = wandb_project
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.estimator = ComplexityEstimator()
+        self.eval_script = "src/eval_humaneval.py"
         
-        # Optimized thresholds based on actual performance data
-        self.thresholds = complexity_thresholds or {
-            'distilled': (1, 6),   # Simple/Medium queries: 1-150 tokens
-            '70B': (7, 10),        # Complex queries: 151+ tokens
-        }
-        
-        # Model names
-        self.model_names = {
-            'distilled': 'distilled-model',
-            '70B': 'Meta-Llama-3.1-70B-Instruct'
-        }
-        
-        # Relative costs
-        self.costs = model_costs or {
-            'distilled': 0.02,
-            '70B': 1.0,
-        }
-        
-        # Actual performance data from evaluation
-        self.performance = {
-            'distilled': 0.5671,  # 56.71% pass@1
-            '70B': 0.7195,        # 71.95% pass@1
-        }
+        # Check if eval script exists
+        if not os.path.exists(self.eval_script):
+            raise FileNotFoundError(f"Evaluation script not found: {self.eval_script}")
     
-    def route(self, query: str) -> Dict:
+    def classify_problems_by_complexity(self) -> Dict[str, List[str]]:
         """
-        Determine which model to use for a query.
+        Classify HumanEval problems by complexity level.
+        
+        Returns:
+            Dictionary with 'simple' (1-6) and 'complex' (7-10) task IDs
         """
-        complexity = self.estimator.estimate_complexity(query)
-        token_count = len(self.estimator.encoder.encode(query))
+        from human_eval.data import read_problems
         
-        for model_type, (min_score, max_score) in self.thresholds.items():
-            if min_score <= complexity <= max_score:
-                return {
-                    'model': self.model_names[model_type],
-                    'model_type': model_type,
-                    'complexity': complexity,
-                    'token_count': token_count,
-                    'cost': self.costs[model_type],
-                    'expected_performance': self.performance[model_type],
-                    'reasoning': self._get_reasoning(complexity, token_count, model_type)
-                }
-        
-        # Default to 70B for safety
-        return {
-            'model': self.model_names['70B'],
-            'model_type': '70B',
-            'complexity': complexity,
-            'token_count': token_count,
-            'cost': self.costs['70B'],
-            'expected_performance': self.performance['70B'],
-            'reasoning': f'Complex query ({token_count} tokens) -> Use 70B for best quality ({self.performance["70B"]*100:.1f}% pass@1)'
+        problems = read_problems()
+        classified = {
+            'simple': [],      # Complexity 1-6
+            'complex': []      # Complexity 7-10
         }
+        
+        for task_id, problem in problems.items():
+            prompt = problem['prompt']
+            complexity = self.estimator.estimate_complexity(prompt)
+            
+            if complexity <= 6:
+                classified['simple'].append(task_id)
+            else:
+                classified['complex'].append(task_id)
+        
+        return classified, problems
     
-    def _get_reasoning(self, complexity: int, token_count: int, model_type: str) -> str:
-        """Explain routing decision based on token count."""
-        performance_pct = self.performance[model_type] * 100
-        if complexity <= 6:
-            return f"Simple/Medium query ({token_count} tokens) -> Use distilled model for 98% cost savings ({performance_pct:.1f}% pass@1)"
+    def create_filtered_problems_file(self, 
+                                     task_ids: List[str], 
+                                     output_file: str) -> str:
+        """
+        Create a temporary HumanEval problems file with only specified task IDs.
+        """
+        from human_eval.data import read_problems, write_jsonl
+        
+        all_problems = read_problems()
+        filtered = {task_id: all_problems[task_id] for task_id in task_ids if task_id in all_problems}
+        
+        # Save filtered problems
+        temp_file = self.output_dir / f"temp_{output_file}_problems.jsonl"
+        problems_list = [{"task_id": k, **v} for k, v in filtered.items()]
+        write_jsonl(str(temp_file), problems_list)
+        
+        return str(temp_file)
+    
+    def run_evaluation(self,
+                      model: str,
+                      output_file: str,
+                      wandb_run_name: str,
+                      lora_dir: Optional[str] = None,
+                      num_samples: int = 10,
+                      task_ids: Optional[List[str]] = None) -> Dict:
+        """
+        Run HumanEval evaluation for a specific model configuration.
+        
+        Args:
+            model: Model name or path
+            output_file: Output JSONL file name
+            wandb_run_name: Name for wandb run
+            lora_dir: Optional LoRA adapter directory
+            num_samples: Number of samples per problem (for pass@k)
+            task_ids: Optional list of task IDs to evaluate (if None, evaluates all)
+        
+        Returns:
+            Evaluation metrics dictionary
+        """
+        output_path = self.output_dir / output_file
+        
+        # Build command
+        cmd = [
+            "python", self.eval_script,
+            "--model", model,
+            "--output", str(output_path),
+            "--num_samples", str(num_samples),
+            "--wandb_api_key", self.wandb_api_key,
+            "--wandb_project", self.wandb_project,
+            "--wandb_run_name", wandb_run_name,
+        ]
+        
+        if lora_dir:
+            cmd.extend(["--lora_dir", lora_dir])
+        
+        print(f"\n{'='*70}")
+        print(f"Running: {wandb_run_name}")
+        print(f"{'='*70}")
+        print(f"Model: {model}")
+        if lora_dir:
+            print(f"LoRA: {lora_dir}")
+        print(f"Output: {output_path}")
+        if task_ids:
+            print(f"Problems: {len(task_ids)} tasks")
         else:
-            return f"Complex query ({token_count} tokens) -> Use 70B for best quality ({performance_pct:.1f}% pass@1)"
+            print(f"Problems: All (164 tasks)")
+        print(f"{'='*70}\n")
+        
+        # If task_ids specified, we need to filter problems
+        # For now, we'll run on all problems and filter results later
+        # (HumanEval doesn't natively support task filtering)
+        
+        # Run evaluation
+        result = subprocess.run(cmd, capture_output=False, text=True)
+        
+        if result.returncode != 0:
+            print(f"ERROR: Evaluation failed for {wandb_run_name}")
+            return None
+        
+        # Load metrics
+        metrics_file = output_path.with_suffix('.metrics.json')
+        if metrics_file.exists():
+            with open(metrics_file, 'r') as f:
+                metrics = json.load(f)
+            return metrics
+        else:
+            print(f"WARNING: Metrics file not found: {metrics_file}")
+            return None
+    
+    def filter_results_by_task_ids(self,
+                                   results_file: str,
+                                   task_ids: List[str],
+                                   output_file: str) -> None:
+        """
+        Filter evaluation results to only include specific task IDs.
+        """
+        from human_eval.data import read_problems, write_jsonl
+        
+        results_path = self.output_dir / results_file
+        output_path = self.output_dir / output_file
+        
+        # Read results
+        with open(results_path, 'r') as f:
+            all_results = [json.loads(line) for line in f]
+        
+        # Filter
+        filtered_results = [r for r in all_results if r['task_id'] in task_ids]
+        
+        # Write filtered results
+        write_jsonl(str(output_path), filtered_results)
+        
+        print(f"Filtered {len(filtered_results)}/{len(all_results)} results -> {output_path}")
+    
+    def evaluate_all_configurations(self):
+        """
+        Run comprehensive evaluation across all configurations.
+        """
+        print("\n" + "="*70)
+        print("COMPREHENSIVE ROUTING EVALUATION")
+        print("="*70)
+        
+        # Step 1: Classify problems
+        print("\nStep 1: Classifying problems by complexity...")
+        classified, all_problems = self.classify_problems_by_complexity()
+        
+        print(f"  Simple (1-6):  {len(classified['simple'])} problems")
+        print(f"  Complex (7-10): {len(classified['complex'])} problems")
+        
+        # Store task IDs for later filtering
+        simple_tasks = classified['simple']
+        complex_tasks = classified['complex']
+        
+        all_metrics = {}
+        
+        # Step 2: Evaluate Distilled Model on Simple Queries (1-6)
+        print("\n" + "="*70)
+        print("EVALUATION 1/6: Distilled Model on Simple Queries (Complexity 1-6)")
+        print("="*70)
+        
+        metrics = self.run_evaluation(
+            model=self.distilled_model,
+            output_file="distilled_simple_all.jsonl",
+            wandb_run_name="distilled_simple_1-6",
+            lora_dir=self.lora_dir,
+            num_samples=10
+        )
+        
+        # Filter results to only simple tasks
+        if metrics:
+            self.filter_results_by_task_ids(
+                "distilled_simple_all.jsonl",
+                simple_tasks,
+                "distilled_simple.jsonl"
+            )
+            all_metrics['distilled_simple'] = metrics
+        
+        # Step 3: Evaluate Distilled Model on Complex Queries (7-10)
+        print("\n" + "="*70)
+        print("EVALUATION 2/6: Distilled Model on Complex Queries (Complexity 7-10)")
+        print("="*70)
+        
+        metrics = self.run_evaluation(
+            model=self.distilled_model,
+            output_file="distilled_complex_all.jsonl",
+            wandb_run_name="distilled_complex_7-10",
+            lora_dir=self.lora_dir,
+            num_samples=10
+        )
+        
+        # Filter results to only complex tasks
+        if metrics:
+            self.filter_results_by_task_ids(
+                "distilled_complex_all.jsonl",
+                complex_tasks,
+                "distilled_complex.jsonl"
+            )
+            all_metrics['distilled_complex'] = metrics
+        
+        # Step 4: Evaluate 70B Model on Simple Queries (1-6)
+        print("\n" + "="*70)
+        print("EVALUATION 3/6: 70B Model on Simple Queries (Complexity 1-6)")
+        print("="*70)
+        
+        metrics = self.run_evaluation(
+            model=self.teacher_model,
+            output_file="70b_simple_all.jsonl",
+            wandb_run_name="70b_simple_1-6",
+            num_samples=10
+        )
+        
+        # Filter results to only simple tasks
+        if metrics:
+            self.filter_results_by_task_ids(
+                "70b_simple_all.jsonl",
+                simple_tasks,
+                "70b_simple.jsonl"
+            )
+            all_metrics['70b_simple'] = metrics
+        
+        # Step 5: Evaluate 70B Model on Complex Queries (7-10)
+        print("\n" + "="*70)
+        print("EVALUATION 4/6: 70B Model on Complex Queries (Complexity 7-10)")
+        print("="*70)
+        
+        metrics = self.run_evaluation(
+            model=self.teacher_model,
+            output_file="70b_complex_all.jsonl",
+            wandb_run_name="70b_complex_7-10",
+            num_samples=10
+        )
+        
+        # Filter results to only complex tasks
+        if metrics:
+            self.filter_results_by_task_ids(
+                "70b_complex_all.jsonl",
+                complex_tasks,
+                "70b_complex.jsonl"
+            )
+            all_metrics['70b_complex'] = metrics
+        
+        # Step 6: Create Routed Results (Hybrid)
+        print("\n" + "="*70)
+        print("EVALUATION 5/6: Creating Routed Results (Hybrid Approach)")
+        print("="*70)
+        
+        self.create_routed_results(simple_tasks, complex_tasks)
+        
+        # Step 7: Evaluate Routed Results
+        print("\n" + "="*70)
+        print("EVALUATION 6/6: Evaluating Routed System")
+        print("="*70)
+        
+        # We need to evaluate the combined results
+        # This is a bit tricky - we'll compute metrics from the combined file
+        routed_metrics = self.evaluate_routed_results("routed_combined.jsonl")
+        all_metrics['routed'] = routed_metrics
+        
+        # Final Summary
+        self.print_comprehensive_summary(all_metrics, classified)
+        
+        return all_metrics
+    
+    def create_routed_results(self, simple_tasks: List[str], complex_tasks: List[str]):
+        """
+        Combine distilled (simple) and 70B (complex) results into routed results.
+        """
+        # Read distilled simple results
+        distilled_simple_path = self.output_dir / "distilled_simple.jsonl"
+        with open(distilled_simple_path, 'r') as f:
+            distilled_simple = [json.loads(line) for line in f]
+        
+        # Read 70B complex results
+        teacher_complex_path = self.output_dir / "70b_complex.jsonl"
+        with open(teacher_complex_path, 'r') as f:
+            teacher_complex = [json.loads(line) for line in f]
+        
+        # Combine
+        routed_results = distilled_simple + teacher_complex
+        
+        # Sort by task_id for consistency
+        routed_results.sort(key=lambda x: x['task_id'])
+        
+        # Write combined results
+        from human_eval.data import write_jsonl
+        routed_path = self.output_dir / "routed_combined.jsonl"
+        write_jsonl(str(routed_path), routed_results)
+        
+        print(f"Created routed results: {len(distilled_simple)} simple + {len(teacher_complex)} complex = {len(routed_results)} total")
+    
+    def evaluate_routed_results(self, results_file: str) -> Dict:
+        """
+        Evaluate the routed (combined) results file.
+        """
+        from human_eval.evaluation import evaluate_functional_correctness
+        
+        results_path = self.output_dir / results_file
+        
+        print(f"Evaluating routed results: {results_path}")
+        
+        # Evaluate pass@k
+        pass_at_k = {}
+        for k in [1, 5, 10]:
+            print(f"  Computing pass@{k}...")
+            metrics = evaluate_functional_correctness(
+                str(results_path),
+                k=[k],
+                n_workers=4,
+                timeout=3.0
+            )
+            pass_at_k[k] = metrics[f'pass@{k}']
+        
+        # Count problems
+        with open(results_path, 'r') as f:
+            results = [json.loads(line) for line in f]
+        
+        # Get unique task IDs
+        unique_tasks = len(set(r['task_id'] for r in results))
+        
+        routed_metrics = {
+            'num_problems': unique_tasks,
+            'num_samples_per_problem': 10,
+            'total_generations': len(results),
+            'pass_at_k': {f'pass@{k}': v for k, v in pass_at_k.items()},
+        }
+        
+        # Save metrics
+        metrics_path = results_path.with_suffix('.metrics.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(routed_metrics, f, indent=2)
+        
+        print(f"Routed metrics saved: {metrics_path}")
+        
+        return routed_metrics
+    
+    def print_comprehensive_summary(self, all_metrics: Dict, classified: Dict):
+        """
+        Print comprehensive summary of all evaluations.
+        """
+        print("\n" + "="*70)
+        print("COMPREHENSIVE EVALUATION SUMMARY")
+        print("="*70)
+        
+        # Problem distribution
+        print(f"\nProblem Distribution:")
+        print(f"  Simple (1-6):  {len(classified['simple'])} problems")
+        print(f"  Complex (7-10): {len(classified['complex'])} problems")
+        print(f"  Total:          {len(classified['simple']) + len(classified['complex'])} problems")
+        
+        # Performance comparison
+        print(f"\n{'Configuration':<30} {'Pass@1':<10} {'Pass@5':<10} {'Pass@10':<10}")
+        print("-" * 70)
+        
+        configs = [
+            ('distilled_simple', 'Distilled on Simple (1-6)'),
+            ('distilled_complex', 'Distilled on Complex (7-10)'),
+            ('70b_simple', '70B on Simple (1-6)'),
+            ('70b_complex', '70B on Complex (7-10)'),
+            ('routed', 'Routed (Hybrid)'),
+        ]
+        
+        for key, name in configs:
+            if key in all_metrics and all_metrics[key]:
+                metrics = all_metrics[key]
+                pass_at_k = metrics.get('pass_at_k', {})
+                p1 = pass_at_k.get('pass@1', 0) * 100
+                p5 = pass_at_k.get('pass@5', 0) * 100
+                p10 = pass_at_k.get('pass@10', 0) * 100
+                print(f"{name:<30} {p1:>6.2f}%    {p5:>6.2f}%    {p10:>6.2f}%")
+        
+        # Cost analysis
+        print(f"\nCost Analysis:")
+        print(f"  Baseline (always 70B):     1.00x")
+        
+        if 'routed' in all_metrics:
+            n_simple = len(classified['simple'])
+            n_complex = len(classified['complex'])
+            total = n_simple + n_complex
+            
+            # Assuming distilled is 0.02x cost, 70B is 1.0x
+            routed_cost = (n_simple * 0.02 + n_complex * 1.0) / total
+            savings = (1.0 - routed_cost) / 1.0 * 100
+            
+            print(f"  Routed (hybrid):           {routed_cost:.2f}x")
+            print(f"  Savings:                   {savings:.1f}%")
+        
+        # Efficiency metrics
+        if 'routed' in all_metrics and '70b_simple' in all_metrics and '70b_complex' in all_metrics:
+            # Baseline efficiency (70B on all)
+            baseline_metrics = all_metrics.get('70b_simple', {}).get('pass_at_k', {})
+            baseline_p1 = baseline_metrics.get('pass@1', 0.72)  # fallback
+            
+            routed_metrics = all_metrics['routed'].get('pass_at_k', {})
+            routed_p1 = routed_metrics.get('pass@1', 0)
+            
+            baseline_efficiency = baseline_p1 / 1.0
+            routed_efficiency = routed_p1 / routed_cost if routed_cost > 0 else 0
+            
+            print(f"\nEfficiency (Performance per Cost):")
+            print(f"  Baseline (70B):   {baseline_efficiency:.3f}")
+            print(f"  Routed (hybrid):  {routed_efficiency:.3f}")
+            if baseline_efficiency > 0:
+                gain = ((routed_efficiency - baseline_efficiency) / baseline_efficiency * 100)
+                print(f"  Efficiency gain:  {gain:+.1f}%")
+        
+        print("\n" + "="*70)
+        print("Evaluation complete! Check wandb for detailed metrics and visualizations.")
+        print("="*70 + "\n")
 
 
-def evaluate_routing_strategy():
+def main():
     """
-    Evaluate routing strategy on HumanEval problems using actual token counts.
+    Main entry point for routing evaluation.
     """
-    from human_eval.data import read_problems
+    import argparse
     
-    router = ModelRouter()
-    problems = read_problems()
+    parser = argparse.ArgumentParser(description="Comprehensive LLM Routing Evaluation")
+    parser.add_argument("--distilled_model", type=str, 
+                       default="meta-llama/Meta-Llama-3.1-8B-Instruct",
+                       help="Distilled model name or path")
+    parser.add_argument("--teacher_model", type=str,
+                       default="meta-llama/Meta-Llama-3.1-70B-Instruct",
+                       help="Teacher model name or path")
+    parser.add_argument("--lora_dir", type=str,
+                       default="outputs/llama31_8b_codealpaca_kd_lora/checkpoint-10010",
+                       help="LoRA adapter directory for distilled model")
+    parser.add_argument("--wandb_api_key", type=str, required=True,
+                       help="Wandb API key")
+    parser.add_argument("--wandb_project", type=str,
+                       default="LLM-Compression-Project",
+                       help="Wandb project name")
+    parser.add_argument("--output_dir", type=str, default="results",
+                       help="Output directory for results")
     
-    # Analyze routing decisions based on actual token counts
-    routing_decisions = {}
+    args = parser.parse_args()
     
-    for task_id, problem in problems.items():
-        prompt = problem['prompt']
-        decision = router.route(prompt)
-        routing_decisions[task_id] = decision
+    # Create evaluator
+    evaluator = RoutingEvaluator(
+        distilled_model_path=args.distilled_model,
+        teacher_model_path=args.teacher_model,
+        lora_dir=args.lora_dir,
+        wandb_api_key=args.wandb_api_key,
+        wandb_project=args.wandb_project,
+        output_dir=args.output_dir
+    )
     
-    # Calculate statistics
-    model_counts = {'distilled': 0, '70B': 0}
-    token_stats = {'distilled': [], '70B': []}
+    # Run comprehensive evaluation
+    try:
+        all_metrics = evaluator.evaluate_all_configurations()
+        
+        # Save comprehensive results
+        summary_file = Path(args.output_dir) / "comprehensive_evaluation_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+        
+        print(f"\nComprehensive results saved to: {summary_file}")
+        
+    except KeyboardInterrupt:
+        print("\n\nEvaluation interrupted by user.")
+        return 1
+    except Exception as e:
+        print(f"\n\nError during evaluation: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
-    for decision in routing_decisions.values():
-        model_type = decision['model_type']
-        model_counts[model_type] += 1
-        token_stats[model_type].append(decision['token_count'])
-    
-    total = len(routing_decisions)
-    
-    print("=" * 70)
-    print("OPTIMIZED ROUTING STRATEGY EVALUATION")
-    print("=" * 70)
-    
-    print(f"\nQuery Distribution ({total} problems):")
-    for model_type in ['distilled', '70B']:
-        count = model_counts[model_type]
-        avg_tokens = sum(token_stats[model_type]) / len(token_stats[model_type]) if token_stats[model_type] else 0
-        performance = router.performance[model_type] * 100
-        print(f"  {model_type:10}: {count:3d} ({count/total*100:5.1f}%) - Avg: {avg_tokens:.0f} tokens, {performance:.1f}% pass@1")
-    
-    # Calculate weighted costs
-    baseline_cost = 1.0 * total
-    routed_cost = sum(router.costs[d['model_type']] for d in routing_decisions.values())
-    savings = (baseline_cost - routed_cost) / baseline_cost * 100
-    
-    print(f"\nCost Analysis:")
-    print(f"  Baseline (always 70B): {baseline_cost:.2f} units")
-    print(f"  With routing:          {routed_cost:.2f} units")
-    print(f"  Savings:               {savings:.1f}%")
-    
-    # Expected performance
-    baseline_perf = router.performance['70B']
-    expected_perf = sum(router.performance[d['model_type']] for d in routing_decisions.values()) / total
-    perf_loss = (baseline_perf - expected_perf) * 100
-    
-    print(f"\nPerformance Analysis:")
-    print(f"  Baseline (always 70B): {baseline_perf*100:.1f}% pass@1")
-    print(f"  With routing:          {expected_perf*100:.1f}% pass@1")
-    print(f"  Performance loss:      {perf_loss:.1f}pp")
-    
-    # Efficiency metrics
-    baseline_efficiency = baseline_perf / 1.0
-    routed_efficiency = expected_perf / (routed_cost / total)
-    
-    print(f"\nEfficiency Analysis:")
-    print(f"  Baseline efficiency: {baseline_efficiency:.3f} performance/cost")
-    print(f"  Routed efficiency:   {routed_efficiency:.3f} performance/cost")
-    print(f"  Efficiency gain:     {((routed_efficiency - baseline_efficiency) / baseline_efficiency * 100):+.1f}%")
-    
-    # Show token distribution
-    print(f"\nToken Count Statistics:")
-    all_tokens = [d['token_count'] for d in routing_decisions.values()]
-    print(f"  Min: {min(all_tokens)} tokens")
-    print(f"  Max: {max(all_tokens)} tokens") 
-    print(f"  Avg: {sum(all_tokens)/len(all_tokens):.1f} tokens")
-    
-    # Show some examples
-    print(f"\nExample Routing Decisions:")
-    print("-" * 70)
-    for i, (task_id, decision) in enumerate(list(routing_decisions.items())[:5]):
-        problem = problems[task_id]
-        prompt_preview = problem['prompt'].split('\n')[0][:50]
-        print(f"\n{i+1}. {task_id}")
-        print(f"   Prompt: {prompt_preview}...")
-        print(f"   Tokens: {decision['token_count']}")
-        print(f"   -> {decision['model']} (complexity={decision['complexity']})")
-        print(f"   -> {decision['reasoning']}")
-    
-    print("=" * 70)
-    
-    return routing_decisions
+    return 0
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 70)
-    print("AFSC/EN Optimized LLM Routing System")
-    print("=" * 70)
-    
-    # Demo with provided test queries
-    router = ModelRouter()
-    
-    test_queries = [
-        "Check if in given list of numbers, are any two numbers closer to each other than given threshold.",
-        "Input to this function is a string containing multiple groups of nested parentheses. Your goal is to separate those group into separate strings and return the list of those. Separate groups are balanced (each open brace is properly closed) and not nested within each other. Ignore any spaces in the input string.",
-        "Given a positive floating point number, it can be decomposed into an integer part (largest integer smaller than given number) and decimals (leftover part always smaller than 1). Return the decimal part of the number.",
-        "You're given a list of deposit and withdrawal operations on a bank account that starts with zero balance. Your task is to detect if at any point the balance of account falls below zero, and at that point function should return True. Otherwise it should return False.",
-        "For a given list of input numbers, calculate Mean Absolute Deviation around the mean of this dataset. Mean Absolute Deviation is the average absolute difference between each element and a centerpoint (mean in this case): MAD = average |x − x_mean|."
-    ]
-    
-    print("\n1. ROUTING EXAMPLES")
-    print("-" * 70)
-    for i, query in enumerate(test_queries, 1):
-        decision = router.route(query)
-        print(f"\n{i}. Query: {query[:80]}...")
-        print(f"   -> Tokens: {decision['token_count']}")
-        print(f"   -> Model: {decision['model']}")
-        print(f"   -> Complexity: {decision['complexity']}/10")
-        print(f"   -> Cost: {decision['cost']:.3f}x (vs 70B)")
-        print(f"   -> Expected performance: {decision['expected_performance']*100:.1f}% pass@1")
-        print(f"   -> {decision['reasoning']}")
-    
-    # Evaluate on HumanEval
-    print("\n\n2. HUMANEVAL EVALUATION")
-    print("-" * 70)
-    try:
-        evaluate_routing_strategy()
-    except Exception as e:
-        print(f"Note: Run after HumanEval results are available")
-        print(f"Error: {e}")
-    
-    print("\nOptimized routing system evaluation complete.")
+    sys.exit(main())
