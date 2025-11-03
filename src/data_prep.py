@@ -1,19 +1,19 @@
 # src/data_prep.py
 """
-CodeAlpaca dataset preparation for knowledge distillation training.
+MBPP dataset preparation for knowledge distillation training.
 
-This script downloads the CodeAlpaca-20k dataset and converts it into 
-chat conversation format for training.
+This script downloads the MBPP (Mostly Basic Python Problems) dataset and 
+converts it into chat conversation format for training.
 
-CodeAlpaca contains:
-  - ~20,000 Python code generation examples
-  - Instruction-following format
-  - Clean, diverse programming problems
+MBPP contains:
+  - ~1,000 Python code generation problems
+  - Function-level tasks with test cases
+  - Clean, educational programming problems
   
 What we create:
-  data/codealpaca_train.jsonl (~16,000 examples - 80%)
-  data/codealpaca_val.jsonl (~2,000 examples - 10%)
-  data/codealpaca_test.jsonl (~2,000 examples - 10%)
+  data/mbpp_train.jsonl (~800 examples - 80%)
+  data/mbpp_val.jsonl (~100 examples - 10%)
+  data/mbpp_test.jsonl (~100 examples - 10%)
 
 Environment variables (optional):
   HF_HOME="$PWD/hf_cache"
@@ -52,14 +52,14 @@ for env_var in ("HF_HOME", "HF_DATASETS_CACHE"):
 random.seed(42)
 
 
-def to_chat(instruction: str, input_text: str, output: str) -> Dict[str, Any]:
+def to_chat(text: str, code: str, test_list: List[str]) -> Dict[str, Any]:
     """
-    Turn CodeAlpaca examples into friendly chat conversations.
+    Turn MBPP examples into friendly chat conversations.
     
     Args:
-        instruction: The task description
-        input_text: Optional additional context/input
-        output: The solution code
+        text: The problem description
+        code: The solution code
+        test_list: List of test cases
     
     Returns:
         Dictionary with 'messages' key containing the conversation
@@ -69,42 +69,45 @@ def to_chat(instruction: str, input_text: str, output: str) -> Dict[str, Any]:
         "Write clean, working code based on the given instructions."
     )
     
-    # Build user message: instruction + optional input
-    user_content = instruction.strip()
+    # Build user message: problem description + test cases
+    user_content = text.strip()
     
-    # Add input context if available
-    if input_text and input_text.strip():
-        user_content += f"\n\nInput:\n{input_text.strip()}"
+    # Add test cases if available
+    if test_list:
+        user_content += "\n\nTest cases:\n"
+        for test in test_list:
+            user_content += f"{test}\n"
     
     return {
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": output.strip()},
+            {"role": "user", "content": user_content.strip()},
+            {"role": "assistant", "content": code.strip()},
         ]
     }
 
 
-def prepare_codealpaca_data() -> None:
+def prepare_mbpp_data() -> None:
     """
-    Download and prepare CodeAlpaca dataset in chat conversation format.
+    Download and prepare MBPP dataset in chat conversation format.
     
     Splits the data into:
-      - Train: 80% (~16,000 examples)
-      - Validation: 10% (~2,000 examples)
-      - Test: 10% (~2,000 examples)
+      - Train: 80% (~800 examples)
+      - Validation: 10% (~100 examples)
+      - Test: 10% (~100 examples)
     """
     from datasets import load_dataset
     
     print("="*70)
-    print("CodeAlpaca Dataset Preparation")
+    print("MBPP Dataset Preparation")
     print("="*70)
     
-    # Load CodeAlpaca dataset from Hugging Face
-    print(f"\n[1/4] Downloading CodeAlpaca-20k dataset from Hugging Face...")
+    # Load MBPP dataset from Hugging Face
+    print(f"\n[1/4] Downloading MBPP dataset from Hugging Face...")
     try:
         dataset = load_dataset(
-            "sahil2801/CodeAlpaca-20k",
+            "mbpp",
+            "sanitized",  # Use sanitized version for better quality
             cache_dir=ISOLATED_CACHE,
             download_mode="reuse_cache_if_exists",
         )
@@ -119,21 +122,21 @@ def prepare_codealpaca_data() -> None:
             print()
         
     except Exception as e:
-        print(f"✗ Failed to download CodeAlpaca dataset: {e}")
+        print(f"✗ Failed to download MBPP dataset: {e}")
         print("\nTroubleshooting:")
         print("  1. Check internet connection")
         print("  2. Try: pip install datasets --upgrade")
         print("  3. Clear cache: rm -rf hf_cache_isolated/")
         raise
     
-    # Get all examples (CodeAlpaca only has 'train' split)
-    if "train" in dataset:
-        all_examples = list(dataset["train"])
-    else:
-        raise ValueError("CodeAlpaca dataset has unexpected structure")
+    # Combine all splits from MBPP
+    all_examples = []
+    for split_name in ["train", "validation", "test"]:
+        if split_name in dataset:
+            all_examples.extend(list(dataset[split_name]))
     
     total_count = len(all_examples)
-    print(f"\n[2/4] Total examples in CodeAlpaca: {total_count}")
+    print(f"\n[2/4] Total examples in MBPP: {total_count}")
     
     # Shuffle for random splits
     random.shuffle(all_examples)
@@ -144,9 +147,9 @@ def prepare_codealpaca_data() -> None:
     # test_size = remaining
     
     splits = [
-        (all_examples[:train_size], "codealpaca_train.jsonl", "Training"),
-        (all_examples[train_size:train_size+val_size], "codealpaca_val.jsonl", "Validation"),
-        (all_examples[train_size+val_size:], "codealpaca_test.jsonl", "Test"),
+        (all_examples[:train_size], "mbpp_train.jsonl", "Training"),
+        (all_examples[train_size:train_size+val_size], "mbpp_val.jsonl", "Validation"),
+        (all_examples[train_size+val_size:], "mbpp_test.jsonl", "Test"),
     ]
     
     total_examples = 0
@@ -174,33 +177,34 @@ def prepare_codealpaca_data() -> None:
                         val_str = str(v)[:100] if v else "None"
                         print(f"    {k}: {val_str}")
                 
-                # Extract fields - CodeAlpaca uses: instruction, input, output
-                instruction = example.get("instruction", "").strip()
-                input_text = example.get("input", "").strip()
-                output = example.get("output", "").strip()
+                # Extract fields - MBPP uses: text, code, test_list
+                text = example.get("text", "").strip()
+                code = example.get("code", "").strip()
+                test_list = example.get("test_list", [])
                 
                 # Skip examples with missing critical fields
-                if not instruction:
+                if not text:
                     if idx == 0:
-                        print(f"  [debug] Skipping: no instruction found")
+                        print(f"  [debug] Skipping: no text found")
                     skipped += 1
                     continue
                     
-                if not output:
+                if not code:
                     if idx == 0:
-                        print(f"  [debug] Skipping: no output found")
+                        print(f"  [debug] Skipping: no code found")
                     skipped += 1
                     continue
                 
                 # Convert to chat format
                 try:
                     chat_record = to_chat(
-                        instruction=instruction,
-                        input_text=input_text,
-                        output=output
+                        text=text,
+                        code=code,
+                        test_list=test_list
                     )
                     
                     # Add metadata for tracking
+                    chat_record["task_id"] = example.get("task_id", idx)
                     chat_record["example_id"] = idx
                     chat_record["split"] = display_name.lower()
                     
@@ -222,7 +226,7 @@ def prepare_codealpaca_data() -> None:
     
     # Summary
     print("\n" + "="*70)
-    print("CodeAlpaca Dataset Preparation Complete!")
+    print("MBPP Dataset Preparation Complete!")
     print("="*70)
     print(f"\nTotal examples prepared: {total_examples}")
     print(f"\nOutput files in '{OUTDIR}/':")
@@ -251,9 +255,9 @@ def verify_data_files() -> bool:
         True if all files are present and valid, False otherwise
     """
     required_files = [
-        "codealpaca_train.jsonl",
-        "codealpaca_val.jsonl", 
-        "codealpaca_test.jsonl",
+        "mbpp_train.jsonl",
+        "mbpp_val.jsonl", 
+        "mbpp_test.jsonl",
     ]
     
     all_valid = True
@@ -284,7 +288,7 @@ def show_sample_data() -> None:
     """
     Display a sample from the training data to verify format.
     """
-    train_file = os.path.join(OUTDIR, "codealpaca_train.jsonl")
+    train_file = os.path.join(OUTDIR, "mbpp_train.jsonl")
     
     if not os.path.exists(train_file):
         print("No training file found to display sample")
@@ -300,6 +304,7 @@ def show_sample_data() -> None:
             try:
                 sample = json.loads(first_line)
                 
+                print("Task ID:", sample.get("task_id", "N/A"))
                 print("Example ID:", sample.get("example_id", "N/A"))
                 print("Split:", sample.get("split", "N/A"))
                 print("\nMessages:")
@@ -321,15 +326,15 @@ def show_sample_data() -> None:
 
 def main():
     """
-    Main entry point for CodeAlpaca data preparation.
+    Main entry point for MBPP data preparation.
     """
     print("\n" + "="*70)
-    print("CodeAlpaca Data Preparation Script")
+    print("MBPP Data Preparation Script")
     print("="*70 + "\n")
     
     # Check if data already exists
     if verify_data_files():
-        print("\n✓ All CodeAlpaca data files already exist and are valid!")
+        print("\n✓ All MBPP data files already exist and are valid!")
         print("\nOptions:")
         print("  1. Continue anyway (will re-download and overwrite)")
         print("  2. Skip preparation")
@@ -347,7 +352,7 @@ def main():
     
     # Prepare the data
     try:
-        prepare_codealpaca_data()
+        prepare_mbpp_data()
         
         # Verify after preparation
         print("\n[Final] Verifying prepared data files...")
