@@ -69,19 +69,14 @@ def to_chat(text: str, code: str, test_list: List[str]) -> Dict[str, Any]:
         "Write clean, working code based on the given instructions."
     )
     
-    # Build user message: problem description + test cases
+    # Build user message: problem description (WITHOUT test cases for training)
+    # We don't include test cases to make it more like HumanEval format
     user_content = text.strip()
-    
-    # Add test cases if available
-    if test_list:
-        user_content += "\n\nTest cases:\n"
-        for test in test_list:
-            user_content += f"{test}\n"
     
     return {
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user_content.strip()},
+            {"role": "user", "content": user_content},
             {"role": "assistant", "content": code.strip()},
         ]
     }
@@ -90,6 +85,8 @@ def to_chat(text: str, code: str, test_list: List[str]) -> Dict[str, Any]:
 def prepare_mbpp_data() -> None:
     """
     Download and prepare MBPP dataset in chat conversation format.
+    
+    Uses the FULL mbpp dataset (not sanitized) for more training data.
     
     Splits the data into:
       - Train: 80% (~800 examples)
@@ -102,38 +99,46 @@ def prepare_mbpp_data() -> None:
     print("MBPP Dataset Preparation")
     print("="*70)
     
-    # Load MBPP dataset from Hugging Face
-    print(f"\n[1/4] Downloading MBPP dataset from Hugging Face...")
+    # Load MBPP dataset from Hugging Face - USE FULL VERSION, NOT SANITIZED
+    print(f"\n[1/4] Downloading MBPP dataset (full version) from Hugging Face...")
     try:
+        # Try full version first
         dataset = load_dataset(
             "mbpp",
-            "sanitized",  # Use sanitized version for better quality
+            "full",  # Use full version for more data
             cache_dir=ISOLATED_CACHE,
             download_mode="reuse_cache_if_exists",
         )
-        print("✓ Dataset downloaded successfully")
-        
-        # Debug: Show what fields are available
-        if "train" in dataset and len(dataset["train"]) > 0:
-            print("\n[debug] Available fields in dataset:")
-            sample = dataset["train"][0]
-            for key in sample.keys():
-                print(f"  - {key}: {type(sample[key])}")
-            print()
+        print("✓ Dataset downloaded successfully (full version)")
         
     except Exception as e:
-        print(f"✗ Failed to download MBPP dataset: {e}")
-        print("\nTroubleshooting:")
-        print("  1. Check internet connection")
-        print("  2. Try: pip install datasets --upgrade")
-        print("  3. Clear cache: rm -rf hf_cache_isolated/")
-        raise
+        print(f"Note: Full version failed ({e}), trying default...")
+        try:
+            # Fallback to default (no config specified)
+            dataset = load_dataset(
+                "mbpp",
+                cache_dir=ISOLATED_CACHE,
+                download_mode="reuse_cache_if_exists",
+            )
+            print("✓ Dataset downloaded successfully (default version)")
+        except Exception as e2:
+            print(f"✗ Failed to download MBPP dataset: {e2}")
+            print("\nTroubleshooting:")
+            print("  1. Check internet connection")
+            print("  2. Try: pip install datasets --upgrade")
+            print("  3. Clear cache: rm -rf hf_cache_isolated/")
+            raise
+    
+    # Debug: Show what splits are available
+    print(f"\n[debug] Available splits: {list(dataset.keys())}")
+    if dataset:
+        for split_name in dataset.keys():
+            print(f"  - {split_name}: {len(dataset[split_name])} examples")
     
     # Combine all splits from MBPP
     all_examples = []
-    for split_name in ["train", "validation", "test"]:
-        if split_name in dataset:
-            all_examples.extend(list(dataset[split_name]))
+    for split_name in dataset.keys():
+        all_examples.extend(list(dataset[split_name]))
     
     total_count = len(all_examples)
     print(f"\n[2/4] Total examples in MBPP: {total_count}")
