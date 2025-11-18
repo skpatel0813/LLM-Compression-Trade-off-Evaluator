@@ -7,6 +7,7 @@ Features:
 - Pass@k metrics: pass@1, pass@5, pass@10
 - GPU & power consumption tracking with wandb
 - Comprehensive metrics logging
+- Metrics saved to dedicated metrics/ folder
 """
 
 import argparse
@@ -552,8 +553,12 @@ def evaluate_humaneval(model, tokenizer, args, gpu_monitor: Optional[GPUMonitor]
             print(f"Pass@{k}: {score:.4f} ({score*100:.2f}%)")
         print(f"{'='*70}\n")
         
-        # Save comprehensive metrics
-        metrics_path = output_path.with_suffix('.metrics.json')
+        # Save comprehensive metrics to dedicated metrics/ folder
+        metrics_dir = Path("metrics")
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        metrics_filename = output_path.stem + '.metrics.json'
+        metrics_path = metrics_dir / metrics_filename
+        
         all_metrics = {
             'model': args.model,
             'lora_dir': args.lora_dir,
